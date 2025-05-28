@@ -12,22 +12,20 @@ use crossterm::{
         self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
     },
     execute,
-    terminal::{
-        Clear as TerminalClear, ClearType, EnterAlternateScreen, LeaveAlternateScreen,
-        disable_raw_mode, enable_raw_mode,
-    },
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use futures::StreamExt;
 use fuzzy_matcher::FuzzyMatcher;
 use fuzzy_matcher::skim::SkimMatcherV2;
-use ratatui::{prelude::*, widgets::*};
+use ratatui::{layout::Position, prelude::*, widgets::*};
 use serde::Deserialize;
+use std::process::Child;
 use std::{
     collections::HashMap,
     env,
     error::Error,
     fs,
-    io::{self, Stdout, Write}, // Added Write
+    io::{self, Write}, // Removed unused Stdout
     path::{Path, PathBuf},
     process::Command as StdCommand,
     sync::{
@@ -37,6 +35,7 @@ use std::{
     time::{Duration, Instant as StdInstant},
 };
 use tempfile::Builder;
+use tempfile::NamedTempFile;
 // tempfile::NamedTempFile is not directly used but Builder::tempfile() returns it.
 use tokio::sync::mpsc;
 
@@ -96,6 +95,7 @@ enum AppMode {
 enum AppAction {
     None,
     LaunchEditor(String),
+    LaunchStreamingEditor(String), // new "non-blocking" streaming editor
 }
 
 #[derive(Clone, Debug)]
@@ -111,7 +111,7 @@ struct App<'a> {
     openai_client: Client<OpenAIConfig>,
     model_to_use: String,
     is_loading: bool,
-    config_source_message: String,
+    _config_source_message: String,
     update_sender: mpsc::Sender<AppUpdate>,
     update_receiver: mpsc::Receiver<AppUpdate>,
     message_list_state: ListState,
@@ -126,7 +126,10 @@ struct App<'a> {
     picker_state: ListState,
     picker_filter_input: String,
     cancel_generation_flag: Arc<AtomicBool>,
-    is_editing_current_input: bool, // Added: Flag to track if editor is for current input
+    is_editing_current_input: bool,
+    editor_file: Option<NamedTempFile>, // Will hold the temp file for streaming editor
+    editor_process: Option<Child>,      // Will hold the child process for streaming editor
+    is_external_editor_active: bool,    // Flag to indicate TUI suspension for external editor
 }
 
 struct Theme<'a> {
@@ -163,28 +166,19 @@ impl Default for Theme<'_> {
 
         Theme {
             base_style: Style::default().fg(text_fg).bg(base_bg),
-
             user_style: Style::default().fg(user_fg),
-
             assistant_style: Style::default().fg(assistant_fg),
-
-            input_block_title_style: Style::default().fg(title_fg), // Using Mauve for consistency
-
-            chat_block_title_style: Style::default().fg(title_fg), // Using Mauve for consistency
-
+            input_block_title_style: Style::default().fg(title_fg),
+            chat_block_title_style: Style::default().fg(title_fg),
             loading_style: Style::default().fg(loading_fg),
-
             status_style: Style::default().fg(status_fg),
-
             highlight_style: Style::default()
                 .fg(highlight_fg)
                 .bg(highlight_bg)
                 .add_modifier(Modifier::BOLD),
-
             picker_title_style: Style::default()
                 .fg(picker_title_fg)
                 .add_modifier(Modifier::BOLD),
-
             _phantom: std::marker::PhantomData,
         }
     }
@@ -213,7 +207,6 @@ fn initialize_database(conn: &Connection) -> RusqliteResult<()> {
 }
 
 // --- Editor Function (blocking) ---
-// Modified to return Result<String, Box<dyn Error>> with the edited content
 fn open_content_in_editor_blocking(initial_content: &str) -> Result<String, Box<dyn Error>> {
     let editor_env = env::var("EDITOR");
     let vis_env = env::var("VISUAL");
@@ -229,10 +222,10 @@ fn open_content_in_editor_blocking(initial_content: &str) -> Result<String, Box<
     let mut temp_file = Builder::new()
         .prefix("chat_edit_")
         .suffix(".md")
-        .tempfile()?; // Propagate error with ?
+        .tempfile()?;
 
     temp_file.write_all(initial_content.as_bytes())?;
-    temp_file.flush()?; // Ensure data is written to disk before editor access
+    temp_file.flush()?;
 
     let temp_file_path = temp_file.path().to_path_buf();
     let temp_file_path_str = temp_file_path.to_string_lossy();
@@ -240,7 +233,6 @@ fn open_content_in_editor_blocking(initial_content: &str) -> Result<String, Box<
     let mut command;
     if cfg!(target_os = "windows") {
         command = StdCommand::new("cmd");
-        // For `start /WAIT`, the first empty string `""` is a dummy title for the new window.
         command.args(["/C", "start", "/WAIT", "\"\"", &editor, &temp_file_path_str]);
     } else {
         command = StdCommand::new("sh");
@@ -248,16 +240,13 @@ fn open_content_in_editor_blocking(initial_content: &str) -> Result<String, Box<
         command.arg("-c").arg(shell_command);
     }
 
-    let status = command.status()?; // Propagate IO errors for command execution
+    let status = command.status()?;
 
     if !status.success() {
         return Err(format!("Editor '{}' exited with status: {}", editor, status).into());
     }
 
-    // Editor finished successfully, read the content back.
-    let edited_content = fs::read_to_string(&temp_file_path)?; // Propagate read errors
-
-    // temp_file will be dropped at the end of the function, deleting the temp file.
+    let edited_content = fs::read_to_string(&temp_file_path)?;
     Ok(edited_content)
 }
 
@@ -275,13 +264,13 @@ impl<'a> App<'a> {
             openai_client: client,
             model_to_use: model,
             is_loading: false,
-            config_source_message: config_source,
+            _config_source_message: config_source,
             update_sender: tx,
             update_receiver: rx,
             message_list_state: ListState::default(),
             input_cursor_position: 0,
             status_message: Some(
-                "Ctrl+O:Open Ctrl+E:EditMsg Ctrl+T:EditInput Ctrl+X:Cancel Enter:Send Ctrl+C:Quit." // Updated help
+                "Ctrl+O:Open Ctrl+E:EditMsg Ctrl+T:EditInput Ctrl+X:Cancel Enter:Send Ctrl+C:Quit."
                     .to_string(),
             ),
             theme: Theme::default(),
@@ -293,7 +282,10 @@ impl<'a> App<'a> {
             picker_filter_input: String::new(),
             picker_state: ListState::default(),
             cancel_generation_flag: Arc::new(AtomicBool::new(false)),
-            is_editing_current_input: false, // Initialize new flag
+            is_editing_current_input: false,
+            editor_file: None,
+            editor_process: None,
+            is_external_editor_active: false, // Initialize new flag
         }
     }
 
@@ -465,9 +457,9 @@ impl<'a> App<'a> {
             }
         });
     }
+
     fn load_all_conversations_from_db(&mut self) -> Result<(), Box<dyn Error>> {
         let mut stmt = self.db_conn.prepare(
-            // Increased limit for better filtering results, adjust as needed
             "SELECT id, title, updated_at FROM conversations ORDER BY updated_at DESC LIMIT 200",
         )?;
         let iter = stmt.query_map([], |row| {
@@ -486,15 +478,12 @@ impl<'a> App<'a> {
             if let Ok(item) = item_result {
                 self.all_conversations.push(item);
             } else if let Err(e) = item_result {
-                // Log this error, but don't necessarily stop the whole app
-                // eprintln!("Error loading a conversation for picker: {}", e);
                 self.status_message = Some(format!("Error loading a conversation: {}", e));
             }
         }
         Ok(())
     }
 
-    // New method to apply filter and update picker_items for display
     fn apply_filter_and_update_picker_items(&mut self) {
         let matcher = SkimMatcherV2::default();
 
@@ -505,7 +494,6 @@ impl<'a> App<'a> {
 
         self.picker_items.clear();
 
-        // Always add "[+] New Chat" as the first item, it's not subject to filtering by title.
         self.picker_items.push(ConversationMeta {
             id: "NEW_CHAT".to_string(),
             title: "[+] New Chat".to_string(),
@@ -514,11 +502,9 @@ impl<'a> App<'a> {
 
         let mut matched_conversations: Vec<ConversationMeta> = Vec::new();
         if self.picker_filter_input.is_empty() {
-            // No filter, add all conversations from the persistent list
             matched_conversations.extend_from_slice(&self.all_conversations);
         } else {
             for conv_meta in &self.all_conversations {
-                // Perform fuzzy match against the conversation title
                 if matcher
                     .fuzzy_match(&conv_meta.title, &self.picker_filter_input)
                     .is_some()
@@ -527,11 +513,8 @@ impl<'a> App<'a> {
                 }
             }
         }
-        // The `all_conversations` are already sorted by `updated_at DESC` from the DB query.
-        // Filtering preserves this relative order.
         self.picker_items.extend(matched_conversations);
 
-        // Attempt to restore selection or select the first item
         if let Some(id_to_reselect) = old_selected_id {
             if let Some(new_idx) = self
                 .picker_items
@@ -540,17 +523,16 @@ impl<'a> App<'a> {
             {
                 self.picker_state.select(Some(new_idx));
             } else if !self.picker_items.is_empty() {
-                self.picker_state.select(Some(0)); // Select first if old selection is gone
+                self.picker_state.select(Some(0));
             } else {
-                self.picker_state.select(None); // No items to select
+                self.picker_state.select(None);
             }
         } else if !self.picker_items.is_empty() {
-            self.picker_state.select(Some(0)); // Default to selecting the first item
+            self.picker_state.select(Some(0));
         } else {
-            self.picker_state.select(None); // No items if list is empty
+            self.picker_state.select(None);
         }
 
-        // Ensure selection is within bounds if it was somehow invalid
         if let Some(selected_idx) = self.picker_state.selected() {
             if selected_idx >= self.picker_items.len() && !self.picker_items.is_empty() {
                 self.picker_state.select(Some(self.picker_items.len() - 1));
@@ -558,10 +540,10 @@ impl<'a> App<'a> {
                 self.picker_state.select(None);
             }
         } else if !self.picker_items.is_empty() {
-            // If nothing selected but list is not empty, select first
             self.picker_state.select(Some(0));
         }
     }
+
     fn handle_chatting_input(
         &mut self,
         key_code: KeyCode,
@@ -570,44 +552,43 @@ impl<'a> App<'a> {
         if key_modifiers == KeyModifiers::CONTROL {
             match key_code {
                 KeyCode::Char('e') => {
-                    // Ctrl+E: Edit selected message (view in editor)
-                    let content_to_edit =
-                        if let Some(selected_idx) = self.message_list_state.selected() {
-                            self.messages
-                                .get(selected_idx)
-                                .map(|msg| msg.content.clone())
-                        } else if self.is_loading {
-                            self.messages
-                                .last()
-                                .filter(|msg| msg.role == Role::Assistant)
-                                .map(|msg| msg.content.clone())
+                    if self.is_loading {
+                        if let Some(last) =
+                            self.messages.last().filter(|m| m.role == Role::Assistant)
+                        {
+                            self.status_message = Some("Opening live editor…".into());
+                            return AppAction::LaunchStreamingEditor(last.content.clone());
+                        } else {
+                            self.status_message = Some("No assistant text to edit".into());
+                            return AppAction::None;
+                        }
+                    } else {
+                        let content_to_edit = if let Some(idx) = self.message_list_state.selected()
+                        {
+                            self.messages.get(idx).map(|m| m.content.clone())
                         } else {
                             None
                         };
-
-                    if let Some(content) = content_to_edit {
-                        self.status_message = Some("Opening message in editor...".to_string());
-                        // self.is_editing_current_input remains false or is set to false in run_app
-                        return AppAction::LaunchEditor(content);
-                    } else {
-                        self.status_message =
-                            Some("No message selected or AI streaming to edit.".to_string());
-                        return AppAction::None;
+                        if let Some(c) = content_to_edit {
+                            self.status_message = Some("Opening message in editor…".into());
+                            return AppAction::LaunchEditor(c);
+                        } else {
+                            self.status_message = Some("No message selected".into());
+                            return AppAction::None;
+                        }
                     }
                 }
                 KeyCode::Char('t') => {
-                    // Ctrl+T: Edit current input buffer
                     if self.is_loading {
                         self.status_message =
                             Some("Cannot edit input while AI is responding.".to_string());
                         return AppAction::None;
                     }
-                    self.is_editing_current_input = true; // Set flag
+                    self.is_editing_current_input = true;
                     self.status_message = Some("Opening input in editor...".to_string());
                     return AppAction::LaunchEditor(self.input.clone());
                 }
                 KeyCode::Char('x') => {
-                    // Ctrl+X: Cancel generation
                     if self.is_loading {
                         self.cancel_generation_flag.store(true, Ordering::Relaxed);
                         self.status_message =
@@ -674,7 +655,7 @@ impl<'a> App<'a> {
         match key_code {
             KeyCode::Esc => {
                 self.app_mode = AppMode::Chatting;
-                self.picker_filter_input.clear(); // Clear filter on exit
+                self.picker_filter_input.clear();
             }
             KeyCode::Up => {
                 if !self.picker_items.is_empty() {
@@ -693,7 +674,6 @@ impl<'a> App<'a> {
             KeyCode::Enter => {
                 if let Some(idx) = self.picker_state.selected() {
                     if idx < self.picker_items.len() {
-                        // picker_items is the filtered list
                         let item = self.picker_items[idx].clone();
                         if item.id == "NEW_CHAT" {
                             self.messages.clear();
@@ -709,13 +689,11 @@ impl<'a> App<'a> {
                             }
                         }
                         self.app_mode = AppMode::Chatting;
-                        self.picker_filter_input.clear(); // Clear filter on selection
+                        self.picker_filter_input.clear();
                     }
                 }
             }
-
             KeyCode::Char(c) if c == 'x' && key_modifiers == KeyModifiers::CONTROL => {
-                // Handle Delete key
                 if let Some(selected_idx) = self.picker_state.selected() {
                     if selected_idx < self.picker_items.len() {
                         let item_to_delete = self.picker_items[selected_idx].clone();
@@ -725,7 +703,6 @@ impl<'a> App<'a> {
                             return;
                         }
 
-                        // Perform deletion from database
                         match self.db_conn.execute(
                             "DELETE FROM conversations WHERE id = ?1",
                             params![item_to_delete.id],
@@ -734,23 +711,18 @@ impl<'a> App<'a> {
                                 if num_deleted > 0 {
                                     self.status_message =
                                         Some(format!("Deleted: {}", item_to_delete.title));
-                                    // Refresh the source list from DB
                                     if let Err(e) = self.load_all_conversations_from_db() {
                                         self.status_message = Some(format!(
                                             "Error reloading conversations after delete: {}",
                                             e
                                         ));
                                     }
-                                    // Re-apply filter (which also adjusts selection)
                                     self.apply_filter_and_update_picker_items();
                                 } else {
-                                    // This case (num_deleted == 0) means the ID wasn't in the DB.
-                                    // Should be rare if picker_items are sourced from DB.
                                     self.status_message = Some(format!(
                                         "Could not delete: '{}' (not found in DB).",
                                         item_to_delete.title
                                     ));
-                                    // Still refresh and re-filter in case of inconsistency
                                     if let Err(e) = self.load_all_conversations_from_db() {
                                         self.status_message =
                                             Some(format!("Error reloading conversations: {}", e));
@@ -769,9 +741,6 @@ impl<'a> App<'a> {
                 }
             }
             KeyCode::Char(c) => {
-                // Prevent filtering if something major is loading (e.g. initial list)
-                // self.is_loading is for AI responses, so it might not be the right flag here.
-                // For simplicity, we allow typing.
                 self.picker_filter_input.push(c);
                 self.apply_filter_and_update_picker_items();
             }
@@ -779,7 +748,6 @@ impl<'a> App<'a> {
                 self.picker_filter_input.pop();
                 self.apply_filter_and_update_picker_items();
             }
-
             _ => {}
         }
     }
@@ -832,7 +800,7 @@ impl<'a> App<'a> {
                     if !chunk.is_empty() {
                         self.messages.push(AppMessage {
                             role: Role::Assistant,
-                            content: chunk,
+                            content: chunk.clone(),
                             timestamp: Utc::now(),
                         });
                         is_new_msg = true;
@@ -843,21 +811,36 @@ impl<'a> App<'a> {
                     } else if !chunk.is_empty() {
                         self.messages.push(AppMessage {
                             role: Role::Assistant,
-                            content: chunk,
+                            content: chunk.clone(),
                             timestamp: Utc::now(),
                         });
                         is_new_msg = true;
                     }
                 }
-                self.status_message = Some("AI Typing...".to_string());
-                if is_new_msg && !self.messages.is_empty() {
-                    self.message_list_state
-                        .select(Some(self.messages.len() - 1));
+
+                if !self.is_external_editor_active {
+                    self.status_message = Some("AI Typing...".to_string());
+                    if is_new_msg && !self.messages.is_empty() {
+                        self.message_list_state
+                            .select(Some(self.messages.len() - 1));
+                    }
+                }
+
+                if self.is_external_editor_active {
+                    // Check this instead of self.editor_file.is_some()
+                    if let Some(file) = &mut self.editor_file {
+                        if let Err(e) = file.write_all(chunk.as_bytes()) {
+                            eprintln!("Error writing to streaming editor file: {}", e);
+                        } else if let Err(e) = file.flush() {
+                            eprintln!("Error flushing streaming editor file: {}", e);
+                        }
+                    }
                 }
             }
             Ok(AppUpdate::AssistantError(err_msg)) => {
-                let now = Utc::now();
+                self.is_loading = false;
                 let content = format!("[Error]: {}", err_msg);
+                let now = Utc::now();
                 self.messages.push(AppMessage {
                     role: Role::Assistant,
                     content: content.clone(),
@@ -865,22 +848,39 @@ impl<'a> App<'a> {
                 });
                 if let Some(id) = &self.current_conversation_id {
                     if let Err(e) = self.add_message_to_db(id, Role::Assistant, &content, now) {
-                        self.status_message = Some(format!("Err save err: {}", e));
+                        if !self.is_external_editor_active {
+                            self.status_message = Some(format!("Err save err: {}", e));
+                        } else {
+                            eprintln!("Err save err: {}", e);
+                        }
                     }
                 }
-                if !self.messages.is_empty() {
-                    self.message_list_state
-                        .select(Some(self.messages.len() - 1));
+
+                if !self.is_external_editor_active {
+                    self.status_message = Some(format!(
+                        "Error: {}",
+                        err_msg.chars().take(50).collect::<String>()
+                    ));
+                    if !self.messages.is_empty() {
+                        self.message_list_state
+                            .select(Some(self.messages.len() - 1));
+                    }
+                } else {
+                    eprintln!("Assistant Error while editor active: {}", err_msg);
                 }
-                self.is_loading = false;
-                self.status_message = Some(format!(
-                    "Error: {}",
-                    err_msg.chars().take(50).collect::<String>()
-                ));
+
+                if self.is_external_editor_active {
+                    // If editor was active, try to clean up
+                    if let Some(mut child) = self.editor_process.take() {
+                        let _ = child.kill(); // Attempt to kill editor
+                        let _ = child.wait(); // Wait for it to ensure cleanup
+                    }
+                    self.editor_file = None; // This will drop and delete the temp file
+                    // self.is_external_editor_active will be reset by run_app's check
+                }
             }
             Ok(AppUpdate::AssistantDone) => {
                 self.is_loading = false;
-                self.status_message = Some("Ready.".to_string());
                 if let Some(id) = &self.current_conversation_id {
                     if let Some(last) = self.messages.last() {
                         if last.role == Role::Assistant && !last.content.is_empty() {
@@ -890,50 +890,43 @@ impl<'a> App<'a> {
                                 &last.content,
                                 last.timestamp,
                             ) {
-                                self.status_message = Some(format!("Err save AI resp: {}", e));
+                                if !self.is_external_editor_active {
+                                    self.status_message = Some(format!("Err save AI resp: {}", e));
+                                } else {
+                                    eprintln!("Err save AI resp: {}", e);
+                                }
                             }
                         }
                     }
                 }
-                if self
-                    .messages
-                    .last()
-                    .map_or(false, |m| m.role == Role::Assistant && m.content.is_empty())
-                {
-                    self.messages.pop();
-                    if self.messages.is_empty() {
-                        self.message_list_state.select(None);
-                    } else {
-                        self.message_list_state
-                            .select(Some(self.messages.len() - 1));
-                    }
-                } else if !self.messages.is_empty()
-                    && self
+
+                if !self.is_external_editor_active {
+                    self.status_message = Some("Ready.".to_string());
+                    if self
                         .messages
                         .last()
-                        .map_or(false, |m| m.role == Role::Assistant)
-                {
-                    if self.message_list_state.selected() != Some(self.messages.len() - 1) {
+                        .map_or(false, |m| m.role == Role::Assistant && m.content.is_empty())
+                    {
+                        self.messages.pop();
+                    }
+                    if !self.messages.is_empty() {
                         self.message_list_state
-                            .select(Some(self.messages.len() - 1));
+                            .select(Some(self.messages.len().saturating_sub(1)));
+                    } else {
+                        self.message_list_state.select(None);
                     }
                 }
+                // If editor was active, user will close it. `run_app` handles process exit.
             }
             Ok(AppUpdate::AssistantCancelled) => {
                 self.is_loading = false;
                 let mut final_status_message = "AI generation cancelled.".to_string();
 
-                // Check if the last message is an assistant's message that might have partial content
                 if let Some(last_msg_idx) = self.messages.len().checked_sub(1) {
                     if self.messages[last_msg_idx].role == Role::Assistant {
-                        // It's an assistant message, check if it has content
                         if !self.messages[last_msg_idx].content.is_empty() {
-                            // Partial content exists, try to save it.
-                            // Clone content and timestamp as self.messages might be modified by pop later if save fails
-                            // (though in this path, we don't pop if content is non-empty).
                             let content_to_save = self.messages[last_msg_idx].content.clone();
                             let timestamp_to_save = self.messages[last_msg_idx].timestamp;
-
                             if let Some(conv_id) = &self.current_conversation_id {
                                 match self.add_message_to_db(
                                     conv_id,
@@ -948,50 +941,53 @@ impl<'a> App<'a> {
                                     }
                                     Err(e) => {
                                         final_status_message = format!(
-                                            "AI generation cancelled. Error saving partial response: {}",
+                                            "AI cancelled. Error saving partial response: {}",
                                             e
                                         );
                                     }
                                 }
                             } else {
-                                // This should ideally not happen if we were streaming for a conversation
-                                final_status_message = "AI generation cancelled. No active conversation (partial content not saved).".to_string();
+                                final_status_message =
+                                    "AI cancelled. No active conv (partial content not saved)."
+                                        .to_string();
                             }
-                            // The message (saved or not, but with content) is the last one. Ensure it's selected.
-                            self.message_list_state.select(Some(last_msg_idx));
                         } else {
-                            // Assistant message exists but its content is empty. Pop it.
-                            self.messages.pop();
+                            self.messages.pop(); // Remove empty assistant message
                             final_status_message =
                                 "AI generation cancelled. No content generated.".to_string();
-                            // message_list_state will be updated below based on the new state of self.messages
                         }
-                    } else {
-                        // Last message is not an assistant's (e.g., it's the user's message).
-                        // Default status is okay. Selection will be handled below.
-                        final_status_message =
-                            "AI generation cancelled. (Last message was not AI)".to_string();
                     }
-                } else {
-                    // No messages in chat at all.
-                    final_status_message =
-                        "AI generation cancelled. No messages in chat.".to_string();
                 }
 
-                // Update message_list_state based on the potentially modified self.messages
-                if self.messages.is_empty() {
-                    self.message_list_state.select(None);
+                if !self.is_external_editor_active {
+                    self.status_message = Some(final_status_message);
+                    if self.messages.is_empty() {
+                        self.message_list_state.select(None);
+                    } else {
+                        self.message_list_state
+                            .select(Some(self.messages.len().saturating_sub(1)));
+                    }
                 } else {
-                    // Select the new last message, or the existing one if no pop occurred.
-                    self.message_list_state
-                        .select(Some(self.messages.len() - 1));
+                    eprintln!("{}", final_status_message);
+                    // If editor was active, user will close it. `run_app` handles process exit.
                 }
-                self.status_message = Some(final_status_message);
             }
             Err(mpsc::error::TryRecvError::Empty) => {}
             Err(mpsc::error::TryRecvError::Disconnected) => {
                 self.is_loading = false;
-                self.status_message = Some("AI worker connection lost.".to_string());
+                if !self.is_external_editor_active {
+                    self.status_message = Some("AI worker connection lost.".to_string());
+                } else {
+                    eprintln!("AI worker connection lost.");
+                }
+                if self.is_external_editor_active {
+                    // If editor was active, try to clean up
+                    if let Some(mut child) = self.editor_process.take() {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                    }
+                    self.editor_file = None;
+                }
             }
         }
     }
@@ -1050,7 +1046,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
     }
     let mut openai_client_config = OpenAIConfig::new();
-    let mut model_to_use = "gpt-4o".to_string();
+    let mut model_to_use = "gpt-4o".to_string(); // Default model
     if let Some(details) = &selected_endpoint_details {
         if let Some(key) = &details.api_key {
             openai_client_config = openai_client_config.with_api_key(key);
@@ -1075,9 +1071,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
     println!("DB initialized.");
     println!("Starting TUI...");
 
+    // Ensure TUI setup only happens if no editor is immediately launched before main loop
+    // For now, setup is standard as editor launch is event-driven.
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?; // Mouse capture might not be needed if not used
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -1085,24 +1083,104 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let res = run_app(&mut terminal, &mut app).await;
 
+    // Cleanup TUI settings
     disable_raw_mode()?;
-    execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture)?;
-    terminal.show_cursor()?;
+    execute!(
+        io::stdout(), // Use a fresh handle if terminal's stdout was moved
+        LeaveAlternateScreen,
+        DisableMouseCapture, // Ensure mouse capture is disabled
+        cursor::Show         // Always show cursor on exit
+    )?;
+    // terminal.show_cursor()?; // Already handled by execute! above
+
     if let Err(err) = res {
         eprintln!("App error: {:?}", err);
     }
     Ok(())
 }
 
-async fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App<'_>) -> io::Result<()> {
+async fn run_app<B: Backend + std::io::Write>(
+    terminal: &mut Terminal<B>,
+    app: &mut App<'_>,
+) -> io::Result<()> {
     let tick_rate = Duration::from_millis(100);
     let mut last_tick = StdInstant::now();
-    // Renamed from pending_editor_action to content_for_editor for clarity
-    let mut content_for_editor: Option<String> = None;
+    let mut content_for_blocking_editor: Option<String> = None;
 
     loop {
-        app.update_from_channel();
+        app.update_from_channel(); // Always process incoming AI updates, which might update editor_file
 
+        // --- Streaming Editor Management ---
+        if app.editor_process.is_some() {
+            // Actively manage if a process was spawned
+            let mut editor_finished_this_tick = false;
+            if let Some(editor_process_mut) = &mut app.editor_process {
+                match editor_process_mut.try_wait() {
+                    Ok(Some(_exit_status)) => {
+                        // Editor exited
+                        editor_finished_this_tick = true;
+                    }
+                    Ok(None) => {
+                        // Editor still running
+                        app.is_external_editor_active = true;
+                        // Minimal sleep to prevent busy-looping, still allow AI chunks to be processed
+                        tokio::time::sleep(Duration::from_millis(30)).await; // shorter sleep
+                        continue; // Skip TUI drawing and TUI event polling
+                    }
+                    Err(e) => {
+                        // Error checking process status
+                        eprintln!("Error checking editor process: {}", e);
+                        editor_finished_this_tick = true; // Treat as finished to attempt cleanup
+                    }
+                }
+            }
+
+            if editor_finished_this_tick {
+                app.editor_process = None; // Clear the process
+                app.editor_file = None; // Drop NamedTempFile, which deletes the file
+                app.is_external_editor_active = false;
+
+                // Restore TUI
+                enable_raw_mode()?;
+                execute!(
+                    terminal.backend_mut(), // Use terminal's backend
+                    EnterAlternateScreen,
+                    EnableMouseCapture,
+                    cursor::Hide
+                )?;
+                terminal.clear()?; // Clear editor remnants from screen
+                app.status_message = Some("Streaming editor closed. Resuming TUI.".to_string());
+                terminal.draw(|f| ui(f, app))?; // Force redraw TUI
+                last_tick = StdInstant::now();
+            }
+        } else {
+            // If editor_process is None, ensure is_external_editor_active is false.
+            // This handles cases where the process might have been cleared by other logic (e.g. error in update_from_channel)
+            if app.is_external_editor_active {
+                app.is_external_editor_active = false;
+                // This state implies an unexpected editor closure or cleanup.
+                // Ensure TUI is restored.
+                enable_raw_mode()?;
+                execute!(
+                    terminal.backend_mut(),
+                    EnterAlternateScreen,
+                    EnableMouseCapture,
+                    cursor::Hide
+                )?;
+                terminal.clear()?;
+                app.status_message = Some("Editor session ended. Resuming TUI.".to_string());
+                terminal.draw(|f| ui(f, app))?;
+                last_tick = StdInstant::now();
+            }
+        }
+
+        // If an external editor is determined to be active (e.g. editor_process.try_wait() returned None),
+        // we skip the rest of the TUI loop for this iteration.
+        if app.is_external_editor_active {
+            continue;
+        }
+
+        // --- Standard TUI Processing (only if no external editor is active) ---
         let timeout = tick_rate
             .checked_sub(last_tick.elapsed())
             .unwrap_or_else(|| Duration::from_secs(0));
@@ -1111,27 +1189,30 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App<'_>) -> i
             if let Event::Key(key) = event::read()? {
                 if key.kind == KeyEventKind::Press {
                     if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('c') {
-                        return Ok(());
+                        if let Some(mut child) = app.editor_process.take() {
+                            // if streaming editor is running
+                            let _ = child.kill(); // Attempt to kill it
+                            let _ = child.wait(); // Wait for it
+                        }
+                        app.editor_file = None; // Ensure temp file is dropped/deleted
+                        return Ok(()); // Exit app
                     }
+
                     if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('o') {
                         app.app_mode = AppMode::PickingConversation;
-                        app.picker_filter_input.clear(); // Clear previous filter input
-
-                        // Load all conversations from DB into app.all_conversations
+                        app.picker_filter_input.clear();
                         if let Err(e) = app.load_all_conversations_from_db() {
                             app.status_message =
                                 Some(format!("Error loading conversations: {}", e));
-                            app.app_mode = AppMode::Chatting; // Revert to chatting if load fails
+                            app.app_mode = AppMode::Chatting;
                         } else {
-                            // Apply filter (initially empty) to populate app.picker_items for display
                             app.apply_filter_and_update_picker_items();
                         }
-
-                        // Draw immediately to show the picker
                         terminal.draw(|f| ui(f, app))?;
                         last_tick = StdInstant::now();
                         continue;
                     }
+
                     let action_result = match app.app_mode {
                         AppMode::Chatting => app.handle_chatting_input(key.code, key.modifiers),
                         AppMode::PickingConversation => {
@@ -1140,36 +1221,151 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App<'_>) -> i
                         }
                     };
 
-                    if let AppAction::LaunchEditor(content) = action_result {
-                        content_for_editor = Some(content); // Store content for the editor
+                    match action_result {
+                        AppAction::LaunchEditor(content) => {
+                            content_for_blocking_editor = Some(content);
+                            // app.is_editing_current_input is set within handle_chatting_input
+                        }
+                        AppAction::LaunchStreamingEditor(initial_content) => {
+                            // 1. Suspend TUI
+                            disable_raw_mode()?; // Give raw mode control to editor
+                            execute!(
+                                terminal.backend_mut(),
+                                LeaveAlternateScreen,
+                                DisableMouseCapture,
+                                cursor::Show // Show cursor for editor
+                            )?;
+                            // terminal.clear() might not be needed if editor clears, but can't hurt.
+                            // No, terminal.clear() uses TUI clear, which is bad here.
+                            // The editor should handle its own screen.
+
+                            // 2. Create temp file
+                            match Builder::new()
+                                .prefix("chat_stream_")
+                                .suffix(".md")
+                                .tempfile()
+                            {
+                                Ok(mut file) => {
+                                    if file.write_all(initial_content.as_bytes()).is_err()
+                                        || file.flush().is_err()
+                                    {
+                                        // Restore TUI immediately on file error
+                                        app.status_message = Some(
+                                            "Streaming editor file write/flush failed.".into(),
+                                        );
+                                        enable_raw_mode()?;
+                                        execute!(
+                                            terminal.backend_mut(),
+                                            EnterAlternateScreen,
+                                            EnableMouseCapture,
+                                            cursor::Hide
+                                        )?;
+                                        terminal.clear()?; // Clear any partial TUI suspension artifacts
+                                    } else {
+                                        let path_str = file.path().to_string_lossy().to_string();
+                                        app.editor_file = Some(file); // Keep file alive in App
+
+                                        // 3. Launch editor (non-blocking spawn)
+                                        let editor_name = env::var("VISUAL")
+                                            .or_else(|_| env::var("EDITOR"))
+                                            .unwrap_or_else(|_| {
+                                                if cfg!(target_os = "windows") {
+                                                    "notepad".to_string()
+                                                } else {
+                                                    "vi".to_string()
+                                                }
+                                            });
+
+                                        let mut cmd;
+                                        if cfg!(target_os = "windows") {
+                                            // For Windows, if editor is GUI (notepad), it detaches.
+                                            // If it's a console editor like vim.exe, it takes over.
+                                            // Using `start /B` could run console apps without new window but still in background.
+                                            // For simplicity, direct spawn:
+                                            cmd = StdCommand::new(&editor_name);
+                                            cmd.arg(&path_str);
+                                        } else {
+                                            cmd = StdCommand::new(&editor_name);
+                                            cmd.arg(&path_str);
+                                        }
+
+                                        match cmd.spawn() {
+                                            Ok(child) => {
+                                                app.editor_process = Some(child);
+                                                app.is_external_editor_active = true; // TUI is now effectively suspended
+                                                // Don't set TUI status_message, it's not visible.
+                                                // eprintln used for out-of-band info if needed.
+                                                eprintln!(
+                                                    "Launched streaming editor: {} with file {}",
+                                                    editor_name, path_str
+                                                );
+                                            }
+                                            Err(e) => {
+                                                app.status_message = Some(format!(
+                                                    "Failed to launch streaming editor: {}",
+                                                    e
+                                                ));
+                                                app.editor_file = None; // Clean up temp file if spawn fails
+                                                // Restore TUI
+                                                enable_raw_mode()?;
+                                                execute!(
+                                                    terminal.backend_mut(),
+                                                    EnterAlternateScreen,
+                                                    EnableMouseCapture,
+                                                    cursor::Hide
+                                                )?;
+                                                terminal.clear()?;
+                                            }
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    // Tempfile creation failed
+                                    app.status_message = Some(format!(
+                                        "Failed to create streaming editor temp file: {}",
+                                        e
+                                    ));
+                                    // Restore TUI (though it might not have been fully suspended yet)
+                                    enable_raw_mode()?; // Ensure raw mode is on for TUI
+                                    execute!(
+                                        terminal.backend_mut(),
+                                        EnterAlternateScreen,
+                                        EnableMouseCapture,
+                                        cursor::Hide
+                                    )?;
+                                    terminal.clear()?;
+                                }
+                            }
+                        }
+                        AppAction::None => {}
                     }
                 }
             }
         }
 
-        if let Some(text_to_edit) = content_for_editor.take() {
-            let mut stdout_handle = io::stdout();
+        // --- Blocking Editor Launch (Ctrl+T or Ctrl+E when not streaming) ---
+        if let Some(text_to_edit) = content_for_blocking_editor.take() {
+            // Suspend TUI
+            disable_raw_mode()?;
             execute!(
-                stdout_handle,
+                terminal.backend_mut(),
                 LeaveAlternateScreen,
                 DisableMouseCapture,
                 cursor::Show
             )?;
-            stdout_handle.flush()?;
-            disable_raw_mode()?;
+            // Don't call terminal.clear() here before external editor
 
             let editor_result = open_content_in_editor_blocking(&text_to_edit);
 
+            // Resume TUI
             enable_raw_mode()?;
-            let mut stdout_resume_handle = io::stdout();
             execute!(
-                stdout_resume_handle,
+                terminal.backend_mut(),
                 EnterAlternateScreen,
                 EnableMouseCapture,
                 cursor::Hide
             )?;
-            stdout_resume_handle.flush()?;
-            terminal.clear()?;
+            terminal.clear()?; // Clear editor remnants
 
             match editor_result {
                 Ok(edited_text) => {
@@ -1178,15 +1374,12 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App<'_>) -> i
                         app.input_cursor_position = app.input.len();
                         app.status_message = Some("Input updated from editor.".to_string());
                     } else {
-                        // Ctrl+E flow: Editing an existing message (view/copy rather than modify in place)
                         let mut preview = edited_text.chars().take(50).collect::<String>();
                         if edited_text.chars().count() > 50 {
                             preview.push_str("...");
                         }
-                        app.status_message = Some(format!(
-                            "Editor closed. Content (not saved to chat): \"{}\"",
-                            preview
-                        ));
+                        app.status_message =
+                            Some(format!("Editor closed. Content (viewed): \"{}\"", preview));
                     }
                 }
                 Err(e) => {
@@ -1194,10 +1387,11 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App<'_>) -> i
                 }
             }
             app.is_editing_current_input = false; // Reset flag
-
+            // Force redraw TUI
             terminal.draw(|f| ui(f, app))?;
             last_tick = StdInstant::now();
-        } else {
+        } else if !app.is_external_editor_active {
+            // Only draw if no editor is active and not just handled blocking editor
             if last_tick.elapsed() >= tick_rate || timeout == Duration::from_secs(0) {
                 terminal.draw(|f| ui(f, app))?;
                 last_tick = StdInstant::now();
@@ -1207,7 +1401,7 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App<'_>) -> i
 }
 
 fn ui(f: &mut Frame, app: &mut App) {
-    f.render_widget(Clear, f.size());
+    f.render_widget(Clear, f.area()); // Clear entire frame first
     match app.app_mode {
         AppMode::Chatting => ui_chatting(f, app),
         AppMode::PickingConversation => ui_picker(f, app),
@@ -1220,18 +1414,25 @@ fn ui_chatting(f: &mut Frame, app: &mut App) {
         .direction(Direction::Vertical)
         .constraints(
             [
-                Constraint::Min(0),
-                Constraint::Length(1),
-                Constraint::Length(3),
+                Constraint::Min(0),    // Chat messages
+                Constraint::Length(1), // Status bar
+                Constraint::Length(3), // Input box
             ]
             .as_ref(),
         )
-        .split(f.size());
+        .split(f.area());
 
     let chat_area_width = chunks[0].width;
-    let chat_pane_height = chunks[0].height;
+    let chat_pane_height = chunks[0].height; // Use this for max_message_block_height calculation
     let highlight_symbol_len = HIGHLIGHT_SYMBOL.len() as u16;
-    let max_message_block_height = (chat_pane_height / 3).max(1);
+
+    // Heuristic for message block height: avoid tiny scrollable areas if pane is small.
+    // If pane is very small, allow messages to take more than 1/3rd.
+    let _max_message_block_height = if chat_pane_height < 10 {
+        (chat_pane_height / 2).max(1) // If very small pane, allow up to half per message block
+    } else {
+        (chat_pane_height / 3).max(1) // Otherwise, 1/3rd is reasonable
+    };
 
     let display_messages: Vec<ListItem> = app
         .messages
@@ -1244,17 +1445,19 @@ fn ui_chatting(f: &mut Frame, app: &mut App) {
             };
             let prefix_str = match msg.role {
                 Role::User => "You: ",
-                Role::Assistant => "AI:  ",
+                Role::Assistant => "AI:  ", // Extra space for alignment
                 _ => "Sys: ",
             };
             let prefix_len = prefix_str.len() as u16;
             let indentation = " ".repeat(prefix_str.len());
 
+            // Ensure content_wrap_width is at least 1
             let content_wrap_width = chat_area_width
-                .saturating_sub(prefix_len)
-                .saturating_sub(highlight_symbol_len);
+                .saturating_sub(prefix_len) // Space for prefix
+                .saturating_sub(highlight_symbol_len.saturating_add(1)) // Space for highlight symbol and a margin
+                .max(1);
 
-            let wrapped_strings = textwrap::wrap(&msg.content, content_wrap_width.max(1) as usize);
+            let wrapped_strings = textwrap::wrap(&msg.content, content_wrap_width as usize);
 
             let mut all_lines: Vec<Line> = vec![];
             let prefix_span = Span::styled(prefix_str, style.add_modifier(Modifier::BOLD));
@@ -1265,11 +1468,13 @@ fn ui_chatting(f: &mut Frame, app: &mut App) {
                     Span::styled(first_wrapped_line.clone(), style),
                 ]));
             } else if !msg.content.is_empty() {
+                // Handle case where content is not empty but wrapping results in no lines (e.g. too small width)
                 all_lines.push(Line::from(vec![
                     prefix_span.clone(),
-                    Span::styled(msg.content.clone(), style),
+                    Span::styled(msg.content.clone(), style), // Show original content, may overflow
                 ]));
             } else {
+                // Empty content (e.g. AI is typing but sent no content yet)
                 all_lines.push(Line::from(prefix_span.clone()));
             }
 
@@ -1280,45 +1485,19 @@ fn ui_chatting(f: &mut Frame, app: &mut App) {
                 ]));
             }
 
-            if all_lines.is_empty() {
-                all_lines.push(Line::from(Span::styled(
-                    prefix_str,
-                    style.add_modifier(Modifier::BOLD),
-                )));
-            }
+            // This logic was for truncating long messages within a ListItem, which List widget handles with scrolling.
+            // If explicit truncation *within* a list item is desired, it needs to be applied carefully.
+            // For now, assume the List widget's scrolling is sufficient.
+            // let final_lines = all_lines; // Simpler: let List handle scrolling of full message content
 
-            let final_lines =
-                if all_lines.len() as u16 > max_message_block_height && chat_pane_height > 0 {
-                    let mut truncated_lines = vec![Line::from(vec![
-                        Span::raw(indentation.clone()),
-                        Span::styled("... (scroll to see more)", theme.status_style),
-                    ])];
-                    truncated_lines.extend(
-                        all_lines.clone().into_iter().skip(
-                            all_lines
-                                .len()
-                                .saturating_sub(max_message_block_height as usize - 1),
-                        ),
-                    );
-                    truncated_lines
-                } else {
-                    all_lines
-                };
-
-            ListItem::new(Text::from(
-                if final_lines.is_empty() && !wrapped_strings.is_empty() && chat_pane_height > 0 {
-                    vec![Line::from("...")]
-                } else {
-                    final_lines
-                },
-            ))
+            ListItem::new(Text::from(all_lines))
         })
         .collect();
 
     let messages_list = List::new(display_messages)
         .block(
             Block::default()
-                .borders(Borders::NONE)
+                .borders(Borders::NONE) // No border for message pane itself
                 .title(Span::styled(
                     APP_TITLE,
                     theme.chat_block_title_style.clone(),
@@ -1376,34 +1555,36 @@ fn ui_chatting(f: &mut Frame, app: &mut App) {
 
     let input_paragraph = Paragraph::new(app.input.as_str())
         .style(if app.is_loading {
-            theme.status_style
+            theme.status_style // Dim input when loading
         } else {
             theme.base_style
         })
         .block(Block::default().borders(Borders::ALL).title(Span::styled(
-            input_title,
+            input_title, // Dynamic title for input
             theme.input_block_title_style.clone(),
         )));
     f.render_widget(input_paragraph, chunks[2]);
 
-    if !app.is_loading && matches!(app.app_mode, AppMode::Chatting) {
-        // Only show cursor in input if chatting and not loading
-        f.set_cursor(
-            chunks[2].x + app.input_cursor_position as u16 + 1,
-            chunks[2].y + 1,
-        );
+    // Only show cursor in input field if in Chatting mode and not loading and no external editor
+    if !app.is_loading
+        && matches!(app.app_mode, AppMode::Chatting)
+        && !app.is_external_editor_active
+    {
+        f.set_cursor_position(Position::new(
+            chunks[2].x + app.input_cursor_position as u16 + 1, // +1 for border
+            chunks[2].y + 1,                                    // +1 for border
+        ));
     }
 }
 
 fn ui_picker(f: &mut Frame, app: &mut App) {
     let theme = &app.theme;
-    // Adjusted popup size slightly for potentially longer title with filter
-    let popup_area = centered_rect(80, 85, f.size());
+    let popup_area = centered_rect(80, 85, f.area()); // 80% width, 85% height
 
-    f.render_widget(Clear, popup_area);
+    f.render_widget(Clear, popup_area); // Clear the area for the popup
 
     let list_items: Vec<ListItem> = app
-        .picker_items // picker_items is now the filtered list
+        .picker_items // picker_items is the filtered list
         .iter()
         .map(|item| {
             let title_style = if item.id == "NEW_CHAT" {
@@ -1418,7 +1599,7 @@ fn ui_picker(f: &mut Frame, app: &mut App) {
             } else {
                 let date = Span::styled(
                     item.updated_at.format(" (%y-%m-%d %H:%M)").to_string(),
-                    theme.status_style.fg(Color::DarkGray),
+                    theme.status_style.fg(Color::DarkGray), // A less prominent color for date
                 );
                 ListItem::new(Line::from(vec![title, date]))
             }
@@ -1431,15 +1612,17 @@ fn ui_picker(f: &mut Frame, app: &mut App) {
         format!("Filter: {}", app.picker_filter_input)
     };
 
-    // Construct the title for the picker block
-    let picker_block_title = format!("{} | Open/New (Esc:Close Del:Delete)", filter_display_text);
+    let picker_block_title = format!(
+        "{} | Open/New (Esc:Close Ctrl+X:Delete)",
+        filter_display_text
+    );
 
     let list_widget = List::new(list_items)
         .block(
             Block::default()
                 .borders(Borders::ALL)
                 .title(Span::styled(
-                    picker_block_title, // Use the new dynamic title
+                    picker_block_title,
                     theme.picker_title_style.clone(),
                 ))
                 .title_alignment(Alignment::Center),

@@ -280,7 +280,7 @@ impl<'a> App<'a> {
             message_list_state: ListState::default(),
             input_cursor_position: 0,
             status_message: Some(
-                "Ctrl+O:Open Ctrl+E:EditMsg Ctrl+T:EditInput Ctrl+X:Cancel Enter:Send Ctrl+C:Quit."
+                "Ctrl+N:New Ctrl+K:Open Ctrl+E:EditMsg Ctrl+T:EditInput Ctrl+X:Cancel Enter:Send Ctrl+C:Quit."
                     .to_string(),
             ),
             theme: Theme::default(),
@@ -514,18 +514,10 @@ impl<'a> App<'a> {
     fn apply_filter_and_update_picker_items(&mut self) {
         let matcher = SkimMatcherV2::default();
 
-        let old_selected_id: Option<String> = self
-            .picker_state
-            .selected()
-            .and_then(|idx| self.picker_items.get(idx).map(|item| item.id.clone()));
+        // Get the currently selected index instead of ID
+        let old_selected_idx = self.picker_state.selected();
 
         self.picker_items.clear();
-
-        self.picker_items.push(ConversationMeta {
-            id: "NEW_CHAT".to_string(),
-            title: "[+] New Chat".to_string(),
-            updated_at: Utc::now(),
-        });
 
         let mut matched_conversations: Vec<ConversationMeta> = Vec::new();
         if self.picker_filter_input.is_empty() {
@@ -542,15 +534,17 @@ impl<'a> App<'a> {
         }
         self.picker_items.extend(matched_conversations);
 
-        if let Some(id_to_reselect) = old_selected_id {
-            if let Some(new_idx) = self
-                .picker_items
-                .iter()
-                .position(|item| item.id == id_to_reselect)
-            {
-                self.picker_state.select(Some(new_idx));
-            } else if !self.picker_items.is_empty() {
-                self.picker_state.select(Some(0));
+        // Try to keep the cursor position at same relative position after delete
+        if let Some(old_idx) = old_selected_idx {
+            if !self.picker_items.is_empty() {
+                let new_index = if old_idx < self.picker_items.len() {
+                    // Keep same position if possible
+                    old_idx
+                } else {
+                    // Otherwise, position at the end of the list
+                    self.picker_items.len() - 1
+                };
+                self.picker_state.select(Some(new_index));
             } else {
                 self.picker_state.select(None);
             }
@@ -558,16 +552,6 @@ impl<'a> App<'a> {
             self.picker_state.select(Some(0));
         } else {
             self.picker_state.select(None);
-        }
-
-        if let Some(selected_idx) = self.picker_state.selected() {
-            if selected_idx >= self.picker_items.len() && !self.picker_items.is_empty() {
-                self.picker_state.select(Some(self.picker_items.len() - 1));
-            } else if self.picker_items.is_empty() {
-                self.picker_state.select(None);
-            }
-        } else if !self.picker_items.is_empty() {
-            self.picker_state.select(Some(0));
         }
     }
 
@@ -578,6 +562,41 @@ impl<'a> App<'a> {
     ) -> AppAction {
         if key_modifiers == KeyModifiers::CONTROL {
             match key_code {
+                KeyCode::Char('n') => {
+                    if self.is_loading {
+                        self.status_message =
+                            Some("Cannot start new chat while AI is responding.".to_string());
+                        return AppAction::None;
+                    }
+                    // Clear current chat and start a new one
+                    self.messages.clear();
+                    self.current_conversation_id = None;
+                    self.input.clear();
+                    self.input_cursor_position = 0;
+                    self.message_list_state.select(None);
+                    // Reset caches for new chat
+                    self.reset_message_cache();
+                    self.status_message = Some("New chat started.".to_string());
+                    return AppAction::None;
+                }
+                KeyCode::Char('k') => {
+                    if self.is_loading {
+                        self.status_message =
+                            Some("Cannot open picker while AI is responding.".to_string());
+                        return AppAction::None;
+                    }
+                    self.app_mode = AppMode::PickingConversation;
+                    self.picker_filter_input.clear();
+                    // Reset the cached conversation title when changing conversations
+                    self.cached_conversation_title = None;
+                    if let Err(e) = self.load_all_conversations_from_db() {
+                        self.status_message = Some(format!("Error loading conversations: {}", e));
+                        self.app_mode = AppMode::Chatting;
+                    } else {
+                        self.apply_filter_and_update_picker_items();
+                    }
+                    return AppAction::None;
+                }
                 KeyCode::Char('e') => {
                     if self.is_loading {
                         if let Some(last) =
@@ -684,13 +703,13 @@ impl<'a> App<'a> {
                 self.app_mode = AppMode::Chatting;
                 self.picker_filter_input.clear();
             }
-            KeyCode::Up => {
+            KeyCode::Up | KeyCode::BackTab => {
                 if !self.picker_items.is_empty() {
                     let current = self.picker_state.selected().unwrap_or(0);
                     self.picker_state.select(Some(current.saturating_sub(1)));
                 }
             }
-            KeyCode::Down => {
+            KeyCode::Down | KeyCode::Tab => {
                 if !self.picker_items.is_empty() {
                     let current = self.picker_state.selected().unwrap_or(0);
                     if current < self.picker_items.len() - 1 {
@@ -702,37 +721,33 @@ impl<'a> App<'a> {
                 if let Some(idx) = self.picker_state.selected() {
                     if idx < self.picker_items.len() {
                         let item = self.picker_items[idx].clone();
-                        if item.id == "NEW_CHAT" {
-                            self.messages.clear();
-                            self.current_conversation_id = None;
-                            self.input.clear();
-                            self.message_list_state.select(None);
-                            self.status_message = Some("New chat started.".to_string());
-                            // Reset caches for new chat
-                            self.reset_message_cache();
+                        if let Err(e) = self.load_selected_conversation(&item.id) {
+                            self.status_message = Some(format!("Err load chat: {}", e));
                         } else {
-                            if let Err(e) = self.load_selected_conversation(&item.id) {
-                                self.status_message = Some(format!("Err load chat: {}", e));
-                            } else {
-                                self.status_message = Some(format!("Loaded: {}", item.title));
-                                // Reset caches for newly loaded conversation
-                                self.reset_message_cache();
-                            }
+                            self.status_message = Some(format!("Loaded: {}", item.title));
+                            // Reset caches for newly loaded conversation
+                            self.reset_message_cache();
                         }
                         self.app_mode = AppMode::Chatting;
                         self.picker_filter_input.clear();
                     }
                 }
             }
+            KeyCode::Char('n') => {
+                self.messages.clear();
+                self.current_conversation_id = None;
+                self.input.clear();
+                self.message_list_state.select(None);
+                self.status_message = Some("New chat started.".to_string());
+                // Reset caches for new chat
+                self.reset_message_cache();
+                self.app_mode = AppMode::Chatting;
+                self.picker_filter_input.clear();
+            }
             KeyCode::Char(c) if c == 'x' && key_modifiers == KeyModifiers::CONTROL => {
                 if let Some(selected_idx) = self.picker_state.selected() {
                     if selected_idx < self.picker_items.len() {
                         let item_to_delete = self.picker_items[selected_idx].clone();
-
-                        if item_to_delete.id == "NEW_CHAT" {
-                            self.status_message = Some("Cannot delete '[+] New Chat'.".to_string());
-                            return;
-                        }
 
                         match self.db_conn.execute(
                             "DELETE FROM conversations WHERE id = ?1",
@@ -1269,20 +1284,6 @@ async fn run_app<B: Backend + std::io::Write>(
                         return Ok(()); // Exit app
                     }
 
-                    if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('o') {
-                        app.app_mode = AppMode::PickingConversation;
-                        app.picker_filter_input.clear();
-                        // Reset the cached conversation title when changing conversations
-                        app.cached_conversation_title = None;
-                        if let Err(e) = app.load_all_conversations_from_db() {
-                            app.status_message =
-                                Some(format!("Error loading conversations: {}", e));
-                            app.app_mode = AppMode::Chatting;
-                        } else {
-                            app.apply_filter_and_update_picker_items();
-                        }
-                    }
-
                     let action_result = match app.app_mode {
                         AppMode::Chatting => app.handle_chatting_input(key.code, key.modifiers),
                         AppMode::PickingConversation => {
@@ -1635,7 +1636,7 @@ fn ui_chatting(f: &mut Frame, app: &mut App) {
     f.render_stateful_widget(messages_list, chunks[0], &mut app.message_list_state);
 
     let status_text = app.status_message.as_deref().unwrap_or(
-        "Ctrl+O:Open Ctrl+E:EditMsg Ctrl+T:EditInput Ctrl+X:Cancel Enter:Send Ctrl+C:Quit.",
+        "Ctrl+N:New Ctrl+K:Open Ctrl+E:EditMsg Ctrl+T:EditInput Ctrl+X:Cancel Enter:Send Ctrl+C:Quit.",
     );
     let status_bar = Paragraph::new(status_text)
         .style(if app.is_loading {
@@ -1689,22 +1690,12 @@ fn ui_picker(f: &mut Frame, app: &mut App) {
         .picker_items // picker_items is the filtered list
         .iter()
         .map(|item| {
-            let title_style = if item.id == "NEW_CHAT" {
-                theme.base_style.fg(Color::LightMagenta) // Style "New Chat" differently
-            } else {
-                theme.base_style
-            };
-            let title = Span::styled(item.title.clone(), title_style);
-
-            if item.id == "NEW_CHAT" {
-                ListItem::new(Line::from(vec![title]))
-            } else {
-                let date = Span::styled(
-                    item.updated_at.format(" (%y-%m-%d %H:%M)").to_string(),
-                    theme.status_style.fg(Color::DarkGray), // A less prominent color for date
-                );
-                ListItem::new(Line::from(vec![title, date]))
-            }
+            let title = Span::styled(item.title.clone(), theme.base_style);
+            let date = Span::styled(
+                item.updated_at.format(" (%y-%m-%d %H:%M)").to_string(),
+                theme.status_style.fg(Color::DarkGray), // A less prominent color for date
+            );
+            ListItem::new(Line::from(vec![title, date]))
         })
         .collect();
 
@@ -1715,7 +1706,7 @@ fn ui_picker(f: &mut Frame, app: &mut App) {
     };
 
     let picker_block_title = format!(
-        "{} | Open/New (Esc:Close Ctrl+X:Delete)",
+        "{} | N:New Esc:Close Ctrl+X:Delete | Tab/↓ Shift+Tab/↑",
         filter_display_text
     );
 

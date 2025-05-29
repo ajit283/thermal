@@ -865,225 +865,233 @@ impl<'a> App<'a> {
     fn update_from_channel(&mut self) -> bool {
         let mut did_receive_update = false;
 
-        match self.update_receiver.try_recv() {
-            Ok(AppUpdate::AssistantChunk(chunk)) => {
-                did_receive_update = true;
-                let mut is_new_msg = false;
-                if self
-                    .messages
-                    .last()
-                    .map_or(true, |m| m.role != Role::Assistant)
-                    || self.messages.is_empty()
-                {
-                    if !chunk.is_empty() {
-                        self.messages.push(AppMessage {
-                            role: Role::Assistant,
-                            content: chunk.clone(),
-                            timestamp: Utc::now(),
-                            cached_wrapped_lines: None,
-                            cached_wrap_width: None,
-                        });
-                        is_new_msg = true;
-                    }
-                } else if let Some(last) = self.messages.last_mut() {
-                    if last.role == Role::Assistant {
-                        last.content.push_str(&chunk);
-                        // Invalidate cache when content changes
-                        last.cached_wrapped_lines = None;
-                        last.cached_wrap_width = None;
-                    } else if !chunk.is_empty() {
-                        self.messages.push(AppMessage {
-                            role: Role::Assistant,
-                            content: chunk.clone(),
-                            timestamp: Utc::now(),
-                            cached_wrapped_lines: None,
-                            cached_wrap_width: None,
-                        });
-                        is_new_msg = true;
-                    }
-                }
-
-                if !self.is_external_editor_active {
-                    self.status_message = Some("AI Typing...".to_string());
-                    // Always keep the latest message selected when AI is typing
-                    if !self.messages.is_empty() {
-                        self.message_list_state
-                            .select(Some(self.messages.len() - 1));
-                    }
-                }
-
-                if self.is_external_editor_active {
-                    // Check this instead of self.editor_file.is_some()
-                    if let Some(file) = &mut self.editor_file {
-                        if let Err(e) = file.write_all(chunk.as_bytes()) {
-                            eprintln!("Error writing to streaming editor file: {}", e);
-                        } else if let Err(e) = file.flush() {
-                            eprintln!("Error flushing streaming editor file: {}", e);
-                        }
-                    }
-                }
-            }
-            Ok(AppUpdate::AssistantError(err_msg)) => {
-                did_receive_update = true;
-                self.is_loading = false;
-                let content = format!("[Error]: {}", err_msg);
-                let now = Utc::now();
-                self.messages.push(AppMessage {
-                    role: Role::Assistant,
-                    content: content.clone(),
-                    timestamp: now,
-                    cached_wrapped_lines: None,
-                    cached_wrap_width: None,
-                });
-                if let Some(id) = &self.current_conversation_id {
-                    if let Err(e) = self.add_message_to_db(id, Role::Assistant, &content, now) {
-                        if !self.is_external_editor_active {
-                            self.status_message = Some(format!("Err save err: {}", e));
-                        } else {
-                            eprintln!("Err save err: {}", e);
-                        }
-                    }
-                }
-
-                if !self.is_external_editor_active {
-                    self.status_message = Some(format!(
-                        "Error: {}",
-                        err_msg.chars().take(50).collect::<String>()
-                    ));
-                    if !self.messages.is_empty() {
-                        self.message_list_state
-                            .select(Some(self.messages.len() - 1));
-                    }
-                } else {
-                    eprintln!("Assistant Error while editor active: {}", err_msg);
-                }
-
-                if self.is_external_editor_active {
-                    // If editor was active, try to clean up
-                    if let Some(mut child) = self.editor_process.take() {
-                        let _ = child.kill(); // Attempt to kill editor
-                        let _ = child.wait(); // Wait for it to ensure cleanup
-                    }
-                    self.editor_file = None; // This will drop and delete the temp file
-                    // self.is_external_editor_active will be reset by run_app's check
-                }
-            }
-            Ok(AppUpdate::AssistantDone) => {
-                did_receive_update = true;
-                self.is_loading = false;
-                if let Some(id) = &self.current_conversation_id {
-                    if let Some(last) = self.messages.last() {
-                        if last.role == Role::Assistant && !last.content.is_empty() {
-                            if let Err(e) = self.add_message_to_db(
-                                id,
-                                Role::Assistant,
-                                &last.content,
-                                last.timestamp,
-                            ) {
-                                if !self.is_external_editor_active {
-                                    self.status_message = Some(format!("Err save AI resp: {}", e));
-                                } else {
-                                    eprintln!("Err save AI resp: {}", e);
-                                }
-                            }
-                        }
-                    }
-                }
-
-                if !self.is_external_editor_active {
-                    self.status_message = Some("Ready.".to_string());
+        // Process ALL available messages in the channel, not just one
+        loop {
+            match self.update_receiver.try_recv() {
+                Ok(AppUpdate::AssistantChunk(chunk)) => {
+                    did_receive_update = true;
+                    let mut is_new_msg = false;
                     if self
                         .messages
                         .last()
-                        .map_or(false, |m| m.role == Role::Assistant && m.content.is_empty())
+                        .map_or(true, |m| m.role != Role::Assistant)
+                        || self.messages.is_empty()
                     {
-                        self.messages.pop();
+                        if !chunk.is_empty() {
+                            self.messages.push(AppMessage {
+                                role: Role::Assistant,
+                                content: chunk.clone(),
+                                timestamp: Utc::now(),
+                                cached_wrapped_lines: None,
+                                cached_wrap_width: None,
+                            });
+                            is_new_msg = true;
+                        }
+                    } else if let Some(last) = self.messages.last_mut() {
+                        if last.role == Role::Assistant {
+                            last.content.push_str(&chunk);
+                            // Invalidate cache when content changes
+                            last.cached_wrapped_lines = None;
+                            last.cached_wrap_width = None;
+                        } else if !chunk.is_empty() {
+                            self.messages.push(AppMessage {
+                                role: Role::Assistant,
+                                content: chunk.clone(),
+                                timestamp: Utc::now(),
+                                cached_wrapped_lines: None,
+                                cached_wrap_width: None,
+                            });
+                            is_new_msg = true;
+                        }
                     }
-                    if !self.messages.is_empty() {
-                        self.message_list_state
-                            .select(Some(self.messages.len().saturating_sub(1)));
-                    } else {
-                        self.message_list_state.select(None);
-                    }
-                }
-                // If editor was active, user will close it. `run_app` handles process exit.
-            }
-            Ok(AppUpdate::AssistantCancelled) => {
-                did_receive_update = true;
-                self.is_loading = false;
-                let mut final_status_message = "AI generation cancelled.".to_string();
 
-                if let Some(last_msg_idx) = self.messages.len().checked_sub(1) {
-                    if self.messages[last_msg_idx].role == Role::Assistant {
-                        if !self.messages[last_msg_idx].content.is_empty() {
-                            let content_to_save = self.messages[last_msg_idx].content.clone();
-                            let timestamp_to_save = self.messages[last_msg_idx].timestamp;
-                            if let Some(conv_id) = &self.current_conversation_id {
-                                match self.add_message_to_db(
-                                    conv_id,
-                                    Role::Assistant,
-                                    &content_to_save,
-                                    timestamp_to_save,
-                                ) {
-                                    Ok(_) => {
-                                        final_status_message =
-                                            "AI generation cancelled. Partial response saved."
-                                                .to_string();
-                                    }
-                                    Err(e) => {
-                                        final_status_message = format!(
-                                            "AI cancelled. Error saving partial response: {}",
-                                            e
-                                        );
-                                    }
-                                }
-                            } else {
-                                final_status_message =
-                                    "AI cancelled. No active conv (partial content not saved)."
-                                        .to_string();
+                    if !self.is_external_editor_active {
+                        self.status_message = Some("AI Typing...".to_string());
+                        // Always keep the latest message selected when AI is typing
+                        if !self.messages.is_empty() {
+                            self.message_list_state
+                                .select(Some(self.messages.len() - 1));
+                        }
+                    }
+
+                    if self.is_external_editor_active {
+                        // Check this instead of self.editor_file.is_some()
+                        if let Some(file) = &mut self.editor_file {
+                            if let Err(e) = file.write_all(chunk.as_bytes()) {
+                                eprintln!("Error writing to streaming editor file: {}", e);
+                            } else if let Err(e) = file.flush() {
+                                eprintln!("Error flushing streaming editor file: {}", e);
                             }
-                        } else {
-                            self.messages.pop(); // Remove empty assistant message
-                            final_status_message =
-                                "AI generation cancelled. No content generated.".to_string();
                         }
                     }
                 }
-
-                if !self.is_external_editor_active {
-                    self.status_message = Some(final_status_message);
-                    if self.messages.is_empty() {
-                        self.message_list_state.select(None);
-                    } else {
-                        self.message_list_state
-                            .select(Some(self.messages.len().saturating_sub(1)));
+                Ok(AppUpdate::AssistantError(err_msg)) => {
+                    did_receive_update = true;
+                    self.is_loading = false;
+                    let content = format!("[Error]: {}", err_msg);
+                    let now = Utc::now();
+                    self.messages.push(AppMessage {
+                        role: Role::Assistant,
+                        content: content.clone(),
+                        timestamp: now,
+                        cached_wrapped_lines: None,
+                        cached_wrap_width: None,
+                    });
+                    if let Some(id) = &self.current_conversation_id {
+                        if let Err(e) = self.add_message_to_db(id, Role::Assistant, &content, now) {
+                            if !self.is_external_editor_active {
+                                self.status_message = Some(format!("Err save err: {}", e));
+                            } else {
+                                eprintln!("Err save err: {}", e);
+                            }
+                        }
                     }
-                } else {
-                    eprintln!("{}", final_status_message);
+
+                    if !self.is_external_editor_active {
+                        self.status_message = Some(format!(
+                            "Error: {}",
+                            err_msg.chars().take(50).collect::<String>()
+                        ));
+                        if !self.messages.is_empty() {
+                            self.message_list_state
+                                .select(Some(self.messages.len() - 1));
+                        }
+                    } else {
+                        eprintln!("Assistant Error while editor active: {}", err_msg);
+                    }
+
+                    if self.is_external_editor_active {
+                        // If editor was active, try to clean up
+                        if let Some(mut child) = self.editor_process.take() {
+                            let _ = child.kill(); // Attempt to kill editor
+                            let _ = child.wait(); // Wait for it to ensure cleanup
+                        }
+                        self.editor_file = None; // This will drop and delete the temp file
+                        // self.is_external_editor_active will be reset by run_app's check
+                    }
+                }
+                Ok(AppUpdate::AssistantDone) => {
+                    did_receive_update = true;
+                    self.is_loading = false;
+                    if let Some(id) = &self.current_conversation_id {
+                        if let Some(last) = self.messages.last() {
+                            if last.role == Role::Assistant && !last.content.is_empty() {
+                                if let Err(e) = self.add_message_to_db(
+                                    id,
+                                    Role::Assistant,
+                                    &last.content,
+                                    last.timestamp,
+                                ) {
+                                    if !self.is_external_editor_active {
+                                        self.status_message =
+                                            Some(format!("Err save AI resp: {}", e));
+                                    } else {
+                                        eprintln!("Err save AI resp: {}", e);
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if !self.is_external_editor_active {
+                        self.status_message = Some("Ready.".to_string());
+                        if self
+                            .messages
+                            .last()
+                            .map_or(false, |m| m.role == Role::Assistant && m.content.is_empty())
+                        {
+                            self.messages.pop();
+                        }
+                        if !self.messages.is_empty() {
+                            self.message_list_state
+                                .select(Some(self.messages.len().saturating_sub(1)));
+                        } else {
+                            self.message_list_state.select(None);
+                        }
+                    }
                     // If editor was active, user will close it. `run_app` handles process exit.
                 }
-            }
-            Err(mpsc::error::TryRecvError::Empty) => {}
-            Err(mpsc::error::TryRecvError::Disconnected) => {
-                did_receive_update = true;
-                self.is_loading = false;
-                if !self.is_external_editor_active {
-                    self.status_message = Some("AI worker connection lost.".to_string());
-                } else {
-                    eprintln!("AI worker connection lost.");
-                }
-                if self.is_external_editor_active {
-                    // If editor was active, try to clean up
-                    if let Some(mut child) = self.editor_process.take() {
-                        let _ = child.kill();
-                        let _ = child.wait();
+                Ok(AppUpdate::AssistantCancelled) => {
+                    did_receive_update = true;
+                    self.is_loading = false;
+                    let mut final_status_message = "AI generation cancelled.".to_string();
+
+                    if let Some(last_msg_idx) = self.messages.len().checked_sub(1) {
+                        if self.messages[last_msg_idx].role == Role::Assistant {
+                            if !self.messages[last_msg_idx].content.is_empty() {
+                                let content_to_save = self.messages[last_msg_idx].content.clone();
+                                let timestamp_to_save = self.messages[last_msg_idx].timestamp;
+                                if let Some(conv_id) = &self.current_conversation_id {
+                                    match self.add_message_to_db(
+                                        conv_id,
+                                        Role::Assistant,
+                                        &content_to_save,
+                                        timestamp_to_save,
+                                    ) {
+                                        Ok(_) => {
+                                            final_status_message =
+                                                "AI generation cancelled. Partial response saved."
+                                                    .to_string();
+                                        }
+                                        Err(e) => {
+                                            final_status_message = format!(
+                                                "AI cancelled. Error saving partial response: {}",
+                                                e
+                                            );
+                                        }
+                                    }
+                                } else {
+                                    final_status_message =
+                                        "AI cancelled. No active conv (partial content not saved)."
+                                            .to_string();
+                                }
+                            } else {
+                                self.messages.pop(); // Remove empty assistant message
+                                final_status_message =
+                                    "AI generation cancelled. No content generated.".to_string();
+                            }
+                        }
                     }
-                    self.editor_file = None;
+
+                    if !self.is_external_editor_active {
+                        self.status_message = Some(final_status_message);
+                        if self.messages.is_empty() {
+                            self.message_list_state.select(None);
+                        } else {
+                            self.message_list_state
+                                .select(Some(self.messages.len().saturating_sub(1)));
+                        }
+                    } else {
+                        eprintln!("{}", final_status_message);
+                        // If editor was active, user will close it. `run_app` handles process exit.
+                    }
+                }
+                Err(mpsc::error::TryRecvError::Empty) => {
+                    // No more messages available, break the loop
+                    break;
+                }
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    did_receive_update = true;
+                    self.is_loading = false;
+                    if !self.is_external_editor_active {
+                        self.status_message = Some("AI worker connection lost.".to_string());
+                    } else {
+                        eprintln!("AI worker connection lost.");
+                    }
+                    if self.is_external_editor_active {
+                        // If editor was active, try to clean up
+                        if let Some(mut child) = self.editor_process.take() {
+                            let _ = child.kill();
+                            let _ = child.wait();
+                        }
+                        self.editor_file = None;
+                    }
+                    break;
                 }
             }
         }
 
-        // Return whether we received an update
+        // Return whether we received any updates
         return did_receive_update;
     }
 }
@@ -1214,8 +1222,8 @@ async fn run_app<B: Backend + std::io::Write>(
     terminal: &mut Terminal<B>,
     app: &mut App<'_>,
 ) -> io::Result<()> {
-    // Use a slower tick rate for background updates
-    let tick_rate = Duration::from_millis(250); // Increased from 100ms to 250ms
+    // Use a faster tick rate for better responsiveness
+    let tick_rate = Duration::from_millis(50); // Reduced from 250ms to 50ms
     let mut last_tick = StdInstant::now();
     let mut content_for_blocking_editor: Option<String> = None;
     let mut needs_redraw = true; // Flag to track if UI needs redrawing

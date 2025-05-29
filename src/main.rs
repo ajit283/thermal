@@ -157,22 +157,26 @@ struct Theme<'a> {
 
 impl Default for Theme<'_> {
     fn default() -> Self {
-        // Catppuccin Macchiato Colors
-        let base_bg = Color::Rgb(0x1e, 0x1e, 0x2e); // Base
-        let text_fg = Color::Rgb(0xca, 0xd3, 0xf5); // Text
+        // Simplified color scheme with just a couple of colors
+        let base_bg = Color::Rgb(0x24, 0x27, 0x3a); // Catppuccin Macchiato base
+        let text_fg = Color::Rgb(0xca, 0xd3, 0xf5); // Main text color
 
-        let user_fg = Color::Rgb(0x89, 0xdc, 0xeb); // Sky (was Cyan)
-        let assistant_fg = Color::Rgb(0xa6, 0xe3, 0xa1); // Green
+        // Primary accent color - soft purple
+        let accent = Color::Rgb(0xc0, 0xb1, 0xed); // Soft purple
 
-        let title_fg = Color::Rgb(0xcb, 0xa6, 0xf7); // Mauve (for general titles)
+        // User and assistant both use the main text color
+        let user_fg = text_fg;
+        let assistant_fg = text_fg;
 
-        let loading_fg = Color::Rgb(0xfa, 0xb3, 0x87); // Peach (was Magenta)
-        let status_fg = Color::Rgb(0xa6, 0xad, 0xc8); // Subtext0 (was Gray)
+        // Use accent for titles and highlights
+        let title_fg = accent;
+        let loading_fg = accent;
+        let status_fg = Color::Rgb(0xa6, 0xad, 0xc8); // Slightly dimmer for status
 
-        let highlight_fg = Color::Rgb(0xb4, 0xbe, 0xfe); // Lavender
-        let highlight_bg = Color::Rgb(0x45, 0x47, 0x5a); // Surface1 (was LightMagenta BG)
-
-        let picker_title_fg = Color::Rgb(0xf5, 0xc2, 0xe7); // Pink (was Magenta)
+        // Highlight uses brighter text with subtle background
+        let highlight_bg = Color::Rgb(0x35, 0x36, 0x45); // Slightly lighter than base background
+        // Ensure highlighted text is very visible (white)
+        let highlight_fg = Color::White;
 
         Theme {
             base_style: Style::default().fg(text_fg).bg(base_bg),
@@ -186,9 +190,7 @@ impl Default for Theme<'_> {
                 .fg(highlight_fg)
                 .bg(highlight_bg)
                 .add_modifier(Modifier::BOLD),
-            picker_title_style: Style::default()
-                .fg(picker_title_fg)
-                .add_modifier(Modifier::BOLD),
+            picker_title_style: Style::default().fg(title_fg).add_modifier(Modifier::BOLD),
             _phantom: std::marker::PhantomData,
         }
     }
@@ -279,10 +281,7 @@ impl<'a> App<'a> {
             update_receiver: rx,
             message_list_state: ListState::default(),
             input_cursor_position: 0,
-            status_message: Some(
-                "Ctrl+N:New Ctrl+K:Open Ctrl+E:EditMsg Ctrl+T:EditInput Ctrl+X:Cancel Enter:Send Ctrl+C:Quit."
-                    .to_string(),
-            ),
+            status_message: Some("".to_string()),
             theme: Theme::default(),
             db_conn,
             app_mode: AppMode::Chatting,
@@ -1270,8 +1269,9 @@ async fn run_app<B: Backend + std::io::Write>(
 
         // Event handling - only poll if timeout hasn't been reached
         if crossterm::event::poll(timeout)? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind == KeyEventKind::Press {
+            let event = event::read()?;
+            match event {
+                Event::Key(key) if key.kind == KeyEventKind::Press => {
                     needs_redraw = true; // Any key press generally requires a redraw
 
                     if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('c') {
@@ -1405,6 +1405,13 @@ async fn run_app<B: Backend + std::io::Write>(
                         AppAction::None => {}
                     }
                 }
+                Event::Resize(_, _) => {
+                    // Terminal was resized, force a redraw
+                    needs_redraw = true;
+                    // Reset message cache to recalculate wrapping
+                    app.reset_message_cache();
+                }
+                _ => {}
             }
         } else if last_tick.elapsed() >= tick_rate {
             // No event, but tick timeout reached
@@ -1635,9 +1642,7 @@ fn ui_chatting(f: &mut Frame, app: &mut App) {
 
     f.render_stateful_widget(messages_list, chunks[0], &mut app.message_list_state);
 
-    let status_text = app.status_message.as_deref().unwrap_or(
-        "Ctrl+N:New Ctrl+K:Open Ctrl+E:EditMsg Ctrl+T:EditInput Ctrl+X:Cancel Enter:Send Ctrl+C:Quit.",
-    );
+    let status_text = app.status_message.as_deref().unwrap_or("");
     let status_bar = Paragraph::new(status_text)
         .style(if app.is_loading {
             theme.loading_style
@@ -1690,12 +1695,60 @@ fn ui_picker(f: &mut Frame, app: &mut App) {
         .picker_items // picker_items is the filtered list
         .iter()
         .map(|item| {
-            let title = Span::styled(item.title.clone(), theme.base_style);
-            let date = Span::styled(
-                item.updated_at.format(" (%y-%m-%d %H:%M)").to_string(),
-                theme.status_style.fg(Color::DarkGray), // A less prominent color for date
-            );
-            ListItem::new(Line::from(vec![title, date]))
+            // Calculate the available width for content (accounting for borders and highlight symbol)
+            let highlight_width = HIGHLIGHT_SYMBOL.chars().count() as u16;
+            let available_width = popup_area
+                .width
+                .saturating_sub(2) // Subtract 2 for borders
+                .saturating_sub(highlight_width + 1); // Highlight symbol + 1 space buffer
+
+            // Fixed date format and length
+            let date_text = item.updated_at.format(" (%y-%m-%d %H:%M)").to_string();
+            let date_len = date_text.chars().count() as u16;
+
+            // Always reserve space for the date plus a small buffer
+            let date_space = date_len + 2; // 2 chars buffer
+
+            // Calculate how much space is left for the title
+            let max_title_len = available_width.saturating_sub(date_space);
+
+            // Truncate title if needed
+            let title_text = if item.title.chars().count() as u16 > max_title_len {
+                let mut shortened = item
+                    .title
+                    .chars()
+                    .take(max_title_len as usize - 3)
+                    .collect::<String>();
+                shortened.push_str("...");
+                shortened
+            } else {
+                item.title.clone()
+            };
+
+            // Get the actual title length before styling
+            let actual_title_len = title_text.chars().count() as u16;
+
+            // Style the title and date (clone title_text to avoid move)
+            let title = Span::styled(title_text.clone(), theme.base_style);
+
+            // Create a line with the title left-aligned and date right-aligned
+            let mut line = Line::default();
+            line.spans.push(title);
+
+            // Calculate padding to push date to the right
+            let padding = available_width
+                .saturating_sub(actual_title_len)
+                .saturating_sub(date_len);
+            line.spans
+                .push(Span::styled(" ".repeat(padding as usize), Style::default()));
+
+            // Add the date with dark gray color
+            line.spans.push(Span::styled(
+                date_text,
+                theme.status_style.fg(Color::DarkGray),
+            ));
+
+            ListItem::new(line)
         })
         .collect();
 

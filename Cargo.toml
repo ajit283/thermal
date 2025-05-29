@@ -3,6 +3,12 @@ name = "thermal"
 version = "0.1.0"
 edition = "2024"
 
+  [[bin]]  
+  name = "thermal-cli"     # <- this will be the installed binary name  
+  path = "src/main.rs"  
+
+
+
 [dependencies]
 async-openai = "0.28.1"
 

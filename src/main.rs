@@ -1,5 +1,6 @@
 use async_openai::{
     Client,
+    config::AzureConfig,
     config::OpenAIConfig,
     types::{
         ChatCompletionRequestAssistantMessageArgs, ChatCompletionRequestMessage,
@@ -103,6 +104,12 @@ struct ConversationMeta {
     id: String,
     title: String,
     updated_at: DateTime<Utc>,
+}
+
+// Create an enum to handle different config types
+enum ClientConfig {
+    OpenAI(OpenAIConfig),
+    Azure(AzureConfig),
 }
 
 struct App<'a> {
@@ -820,7 +827,8 @@ impl<'a> App<'a> {
 
                 if !self.is_external_editor_active {
                     self.status_message = Some("AI Typing...".to_string());
-                    if is_new_msg && !self.messages.is_empty() {
+                    // Always keep the latest message selected when AI is typing
+                    if !self.messages.is_empty() {
                         self.message_list_state
                             .select(Some(self.messages.len() - 1));
                     }
@@ -1423,12 +1431,12 @@ fn ui_chatting(f: &mut Frame, app: &mut App) {
         .split(f.area());
 
     let chat_area_width = chunks[0].width;
-    let chat_pane_height = chunks[0].height; // Use this for max_message_block_height calculation
+    let chat_pane_height = chunks[0].height;
     let highlight_symbol_len = HIGHLIGHT_SYMBOL.len() as u16;
 
     // Heuristic for message block height: avoid tiny scrollable areas if pane is small.
     // If pane is very small, allow messages to take more than 1/3rd.
-    let _max_message_block_height = if chat_pane_height < 10 {
+    let max_message_block_height = if chat_pane_height < 10 {
         (chat_pane_height / 2).max(1) // If very small pane, allow up to half per message block
     } else {
         (chat_pane_height / 3).max(1) // Otherwise, 1/3rd is reasonable
@@ -1485,12 +1493,17 @@ fn ui_chatting(f: &mut Frame, app: &mut App) {
                 ]));
             }
 
-            // This logic was for truncating long messages within a ListItem, which List widget handles with scrolling.
-            // If explicit truncation *within* a list item is desired, it needs to be applied carefully.
-            // For now, assume the List widget's scrolling is sufficient.
-            // let final_lines = all_lines; // Simpler: let List handle scrolling of full message content
+            // If content is larger than max height, show the last lines (auto-scroll)
+            let display_lines = if all_lines.len() > max_message_block_height as usize {
+                let start_idx = all_lines
+                    .len()
+                    .saturating_sub(max_message_block_height as usize);
+                all_lines[start_idx..].to_vec()
+            } else {
+                all_lines
+            };
 
-            ListItem::new(Text::from(all_lines))
+            ListItem::new(Text::from(display_lines))
         })
         .collect();
 

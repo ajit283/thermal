@@ -73,6 +73,40 @@ fn load_toml_config(path: &Path) -> Result<EndpointsTomlConfig, Box<dyn Error>> 
     Ok(config)
 }
 
+// --- Function to find endpoints.toml in multiple locations ---
+fn find_toml_config_path() -> Result<PathBuf, Box<dyn Error>> {
+    // First try current directory
+    let current_dir_path = Path::new("endpoints.toml");
+    if current_dir_path.exists() {
+        return Ok(current_dir_path.to_path_buf());
+    }
+
+    // Then try XDG config directory
+    if let Some(config_dir) = dirs::config_dir() {
+        let thermal_config_dir = config_dir.join("thermal");
+        let config_path = thermal_config_dir.join("endpoints.toml");
+
+        if config_path.exists() {
+            return Ok(config_path);
+        }
+
+        // If the file doesn't exist but we want to indicate where it should be created,
+        // create the directory and return the path
+        if let Err(e) = fs::create_dir_all(&thermal_config_dir) {
+            eprintln!(
+                "Warning: Could not create config directory {}: {}",
+                thermal_config_dir.display(),
+                e
+            );
+        }
+
+        return Ok(config_path);
+    }
+
+    // Fallback to current directory if XDG config dir is not available
+    Ok(current_dir_path.to_path_buf())
+}
+
 // --- Application State and Messages ---
 #[derive(Clone)]
 struct AppMessage {
@@ -533,21 +567,8 @@ impl<'a> App<'a> {
         }
         self.picker_items.extend(matched_conversations);
 
-        // Try to keep the cursor position at same relative position after delete
-        if let Some(old_idx) = old_selected_idx {
-            if !self.picker_items.is_empty() {
-                let new_index = if old_idx < self.picker_items.len() {
-                    // Keep same position if possible
-                    old_idx
-                } else {
-                    // Otherwise, position at the end of the list
-                    self.picker_items.len() - 1
-                };
-                self.picker_state.select(Some(new_index));
-            } else {
-                self.picker_state.select(None);
-            }
-        } else if !self.picker_items.is_empty() {
+        // Always select the first item when filter changes
+        if !self.picker_items.is_empty() {
             self.picker_state.select(Some(0));
         } else {
             self.picker_state.select(None);
@@ -715,6 +736,10 @@ impl<'a> App<'a> {
                         self.picker_state.select(Some(current + 1));
                     }
                 }
+            }
+            KeyCode::Char('k') if key_modifiers == KeyModifiers::CONTROL => {
+                self.app_mode = AppMode::Chatting;
+                self.picker_filter_input.clear();
             }
             KeyCode::Enter => {
                 if let Some(idx) = self.picker_state.selected() {
@@ -1079,13 +1104,29 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
         i += 1;
     }
-    let toml_path = Path::new("endpoints.toml");
-    let toml_config = load_toml_config(toml_path).unwrap_or_else(|err| {
+    let toml_path = find_toml_config_path().unwrap_or_else(|e| {
         eprintln!(
-            "Warning: Could not load '{}': {}. Using defaults.",
-            toml_path.display(),
-            err
+            "Warning: Could not determine config path: {}. Using current directory.",
+            e
         );
+        PathBuf::from("endpoints.toml")
+    });
+
+    println!("Looking for config at: {}", toml_path.display());
+
+    let toml_config = load_toml_config(&toml_path).unwrap_or_else(|err| {
+        if toml_path.exists() {
+            eprintln!(
+                "Warning: Could not parse '{}': {}. Using defaults.",
+                toml_path.display(),
+                err
+            );
+        } else {
+            println!(
+                "Config file '{}' not found. Using defaults.",
+                toml_path.display()
+            );
+        }
         EndpointsTomlConfig::default()
     });
     let mut selected_endpoint_details: Option<OpenAIEndpointToml> = None;
@@ -1752,27 +1793,9 @@ fn ui_picker(f: &mut Frame, app: &mut App) {
         })
         .collect();
 
-    let filter_display_text = if app.picker_filter_input.is_empty() {
-        "Type to filter".to_string()
-    } else {
-        format!("Filter: {}", app.picker_filter_input)
-    };
-
-    let picker_block_title = format!(
-        "{} | N:New Esc:Close Ctrl+X:Delete | Tab/↓ Shift+Tab/↑",
-        filter_display_text
-    );
-
+    // Render the list widget without any title
     let list_widget = List::new(list_items)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(Span::styled(
-                    picker_block_title,
-                    theme.picker_title_style.clone(),
-                ))
-                .title_alignment(Alignment::Center),
-        )
+        .block(Block::default().borders(Borders::ALL))
         .highlight_style(theme.highlight_style.clone())
         .highlight_symbol(HIGHLIGHT_SYMBOL);
 

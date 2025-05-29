@@ -79,6 +79,8 @@ struct AppMessage {
     role: Role,
     content: String,
     timestamp: DateTime<Utc>,
+    cached_wrapped_lines: Option<Vec<String>>, // Cache for wrapped lines
+    cached_wrap_width: Option<u16>,            // Width used for the cached wrap
 }
 
 enum AppUpdate {
@@ -137,6 +139,7 @@ struct App<'a> {
     editor_file: Option<NamedTempFile>, // Will hold the temp file for streaming editor
     editor_process: Option<Child>,      // Will hold the child process for streaming editor
     is_external_editor_active: bool,    // Flag to indicate TUI suspension for external editor
+    cached_conversation_title: Option<String>, // Cache for conversation title
 }
 
 struct Theme<'a> {
@@ -293,6 +296,7 @@ impl<'a> App<'a> {
             editor_file: None,
             editor_process: None,
             is_external_editor_active: false, // Initialize new flag
+            cached_conversation_title: None,  // Initialize cached conversation title
         }
     }
 
@@ -339,6 +343,16 @@ impl<'a> App<'a> {
         Ok(())
     }
 
+    fn reset_message_cache(&mut self) {
+        // Reset cached message formatting for all messages
+        for msg in &mut self.messages {
+            msg.cached_wrapped_lines = None;
+            msg.cached_wrap_width = None;
+        }
+        // Reset cached conversation title
+        self.cached_conversation_title = None;
+    }
+
     fn submit_message(&mut self) {
         let trimmed_input = self.input.trim();
         if trimmed_input.is_empty() || self.is_loading {
@@ -360,6 +374,8 @@ impl<'a> App<'a> {
             role: Role::User,
             content: user_message_content.clone(),
             timestamp: now,
+            cached_wrapped_lines: None,
+            cached_wrap_width: None,
         });
         if let Err(e) =
             self.add_message_to_db(&current_conv_id, Role::User, &user_message_content, now)
@@ -372,6 +388,10 @@ impl<'a> App<'a> {
         self.input_cursor_position = 0;
         self.is_loading = true;
         self.status_message = Some("Sending to AI...".to_string());
+
+        // Clear the conversation title cache when a new message is submitted
+        self.cached_conversation_title = None;
+
         let history_for_api: Vec<ChatCompletionRequestMessage> = self
             .messages
             .iter()
@@ -688,11 +708,15 @@ impl<'a> App<'a> {
                             self.input.clear();
                             self.message_list_state.select(None);
                             self.status_message = Some("New chat started.".to_string());
+                            // Reset caches for new chat
+                            self.reset_message_cache();
                         } else {
                             if let Err(e) = self.load_selected_conversation(&item.id) {
                                 self.status_message = Some(format!("Err load chat: {}", e));
                             } else {
                                 self.status_message = Some(format!("Loaded: {}", item.title));
+                                // Reset caches for newly loaded conversation
+                                self.reset_message_cache();
                             }
                         }
                         self.app_mode = AppMode::Chatting;
@@ -776,6 +800,8 @@ impl<'a> App<'a> {
                     .get::<_, String>(2)?
                     .parse::<DateTime<Utc>>()
                     .unwrap_or_else(|_| Utc::now()),
+                cached_wrapped_lines: None,
+                cached_wrap_width: None,
             })
         })?;
         for msg_result in iter {
@@ -791,12 +817,18 @@ impl<'a> App<'a> {
         } else {
             Some(self.messages.len() - 1)
         });
+
+        // Clear the conversation title cache when loading a new conversation
+        self.cached_conversation_title = None;
         Ok(())
     }
 
-    fn update_from_channel(&mut self) {
+    fn update_from_channel(&mut self) -> bool {
+        let mut did_receive_update = false;
+
         match self.update_receiver.try_recv() {
             Ok(AppUpdate::AssistantChunk(chunk)) => {
+                did_receive_update = true;
                 let mut is_new_msg = false;
                 if self
                     .messages
@@ -809,17 +841,24 @@ impl<'a> App<'a> {
                             role: Role::Assistant,
                             content: chunk.clone(),
                             timestamp: Utc::now(),
+                            cached_wrapped_lines: None,
+                            cached_wrap_width: None,
                         });
                         is_new_msg = true;
                     }
                 } else if let Some(last) = self.messages.last_mut() {
                     if last.role == Role::Assistant {
                         last.content.push_str(&chunk);
+                        // Invalidate cache when content changes
+                        last.cached_wrapped_lines = None;
+                        last.cached_wrap_width = None;
                     } else if !chunk.is_empty() {
                         self.messages.push(AppMessage {
                             role: Role::Assistant,
                             content: chunk.clone(),
                             timestamp: Utc::now(),
+                            cached_wrapped_lines: None,
+                            cached_wrap_width: None,
                         });
                         is_new_msg = true;
                     }
@@ -846,6 +885,7 @@ impl<'a> App<'a> {
                 }
             }
             Ok(AppUpdate::AssistantError(err_msg)) => {
+                did_receive_update = true;
                 self.is_loading = false;
                 let content = format!("[Error]: {}", err_msg);
                 let now = Utc::now();
@@ -853,6 +893,8 @@ impl<'a> App<'a> {
                     role: Role::Assistant,
                     content: content.clone(),
                     timestamp: now,
+                    cached_wrapped_lines: None,
+                    cached_wrap_width: None,
                 });
                 if let Some(id) = &self.current_conversation_id {
                     if let Err(e) = self.add_message_to_db(id, Role::Assistant, &content, now) {
@@ -888,6 +930,7 @@ impl<'a> App<'a> {
                 }
             }
             Ok(AppUpdate::AssistantDone) => {
+                did_receive_update = true;
                 self.is_loading = false;
                 if let Some(id) = &self.current_conversation_id {
                     if let Some(last) = self.messages.last() {
@@ -927,6 +970,7 @@ impl<'a> App<'a> {
                 // If editor was active, user will close it. `run_app` handles process exit.
             }
             Ok(AppUpdate::AssistantCancelled) => {
+                did_receive_update = true;
                 self.is_loading = false;
                 let mut final_status_message = "AI generation cancelled.".to_string();
 
@@ -982,6 +1026,7 @@ impl<'a> App<'a> {
             }
             Err(mpsc::error::TryRecvError::Empty) => {}
             Err(mpsc::error::TryRecvError::Disconnected) => {
+                did_receive_update = true;
                 self.is_loading = false;
                 if !self.is_external_editor_active {
                     self.status_message = Some("AI worker connection lost.".to_string());
@@ -998,6 +1043,9 @@ impl<'a> App<'a> {
                 }
             }
         }
+
+        // Return whether we received an update
+        return did_receive_update;
     }
 }
 
@@ -1111,12 +1159,20 @@ async fn run_app<B: Backend + std::io::Write>(
     terminal: &mut Terminal<B>,
     app: &mut App<'_>,
 ) -> io::Result<()> {
-    let tick_rate = Duration::from_millis(100);
+    // Use a slower tick rate for background updates
+    let tick_rate = Duration::from_millis(250); // Increased from 100ms to 250ms
     let mut last_tick = StdInstant::now();
     let mut content_for_blocking_editor: Option<String> = None;
+    let mut needs_redraw = true; // Flag to track if UI needs redrawing
+
+    // Force initial draw
+    terminal.draw(|f| ui(f, app))?;
 
     loop {
-        app.update_from_channel(); // Always process incoming AI updates, which might update editor_file
+        // Process AI updates and set redraw flag if updates occurred
+        if app.update_from_channel() {
+            needs_redraw = true;
+        }
 
         // --- Streaming Editor Management ---
         if app.editor_process.is_some() {
@@ -1127,6 +1183,7 @@ async fn run_app<B: Backend + std::io::Write>(
                     Ok(Some(_exit_status)) => {
                         // Editor exited
                         editor_finished_this_tick = true;
+                        needs_redraw = true;
                     }
                     Ok(None) => {
                         // Editor still running
@@ -1139,6 +1196,7 @@ async fn run_app<B: Backend + std::io::Write>(
                         // Error checking process status
                         eprintln!("Error checking editor process: {}", e);
                         editor_finished_this_tick = true; // Treat as finished to attempt cleanup
+                        needs_redraw = true;
                     }
                 }
             }
@@ -1147,6 +1205,7 @@ async fn run_app<B: Backend + std::io::Write>(
                 app.editor_process = None; // Clear the process
                 app.editor_file = None; // Drop NamedTempFile, which deletes the file
                 app.is_external_editor_active = false;
+                needs_redraw = true;
 
                 // Restore TUI
                 enable_raw_mode()?;
@@ -1160,12 +1219,13 @@ async fn run_app<B: Backend + std::io::Write>(
                 app.status_message = Some("Streaming editor closed. Resuming TUI.".to_string());
                 terminal.draw(|f| ui(f, app))?; // Force redraw TUI
                 last_tick = StdInstant::now();
+                needs_redraw = false; // Just redrew
             }
         } else {
             // If editor_process is None, ensure is_external_editor_active is false.
-            // This handles cases where the process might have been cleared by other logic (e.g. error in update_from_channel)
             if app.is_external_editor_active {
                 app.is_external_editor_active = false;
+                needs_redraw = true;
                 // This state implies an unexpected editor closure or cleanup.
                 // Ensure TUI is restored.
                 enable_raw_mode()?;
@@ -1179,11 +1239,11 @@ async fn run_app<B: Backend + std::io::Write>(
                 app.status_message = Some("Editor session ended. Resuming TUI.".to_string());
                 terminal.draw(|f| ui(f, app))?;
                 last_tick = StdInstant::now();
+                needs_redraw = false; // Just redrew
             }
         }
 
-        // If an external editor is determined to be active (e.g. editor_process.try_wait() returned None),
-        // we skip the rest of the TUI loop for this iteration.
+        // If an external editor is active, skip the rest of the loop
         if app.is_external_editor_active {
             continue;
         }
@@ -1193,9 +1253,12 @@ async fn run_app<B: Backend + std::io::Write>(
             .checked_sub(last_tick.elapsed())
             .unwrap_or_else(|| Duration::from_secs(0));
 
+        // Event handling - only poll if timeout hasn't been reached
         if crossterm::event::poll(timeout)? {
             if let Event::Key(key) = event::read()? {
                 if key.kind == KeyEventKind::Press {
+                    needs_redraw = true; // Any key press generally requires a redraw
+
                     if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('c') {
                         if let Some(mut child) = app.editor_process.take() {
                             // if streaming editor is running
@@ -1209,6 +1272,8 @@ async fn run_app<B: Backend + std::io::Write>(
                     if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('o') {
                         app.app_mode = AppMode::PickingConversation;
                         app.picker_filter_input.clear();
+                        // Reset the cached conversation title when changing conversations
+                        app.cached_conversation_title = None;
                         if let Err(e) = app.load_all_conversations_from_db() {
                             app.status_message =
                                 Some(format!("Error loading conversations: {}", e));
@@ -1216,9 +1281,6 @@ async fn run_app<B: Backend + std::io::Write>(
                         } else {
                             app.apply_filter_and_update_picker_items();
                         }
-                        terminal.draw(|f| ui(f, app))?;
-                        last_tick = StdInstant::now();
-                        continue;
                     }
 
                     let action_result = match app.app_mode {
@@ -1243,9 +1305,6 @@ async fn run_app<B: Backend + std::io::Write>(
                                 DisableMouseCapture,
                                 cursor::Show // Show cursor for editor
                             )?;
-                            // terminal.clear() might not be needed if editor clears, but can't hurt.
-                            // No, terminal.clear() uses TUI clear, which is bad here.
-                            // The editor should handle its own screen.
 
                             // 2. Create temp file
                             match Builder::new()
@@ -1269,6 +1328,7 @@ async fn run_app<B: Backend + std::io::Write>(
                                             cursor::Hide
                                         )?;
                                         terminal.clear()?; // Clear any partial TUI suspension artifacts
+                                        needs_redraw = true;
                                     } else {
                                         let path_str = file.path().to_string_lossy().to_string();
                                         app.editor_file = Some(file); // Keep file alive in App
@@ -1286,10 +1346,6 @@ async fn run_app<B: Backend + std::io::Write>(
 
                                         let mut cmd;
                                         if cfg!(target_os = "windows") {
-                                            // For Windows, if editor is GUI (notepad), it detaches.
-                                            // If it's a console editor like vim.exe, it takes over.
-                                            // Using `start /B` could run console apps without new window but still in background.
-                                            // For simplicity, direct spawn:
                                             cmd = StdCommand::new(&editor_name);
                                             cmd.arg(&path_str);
                                         } else {
@@ -1301,8 +1357,6 @@ async fn run_app<B: Backend + std::io::Write>(
                                             Ok(child) => {
                                                 app.editor_process = Some(child);
                                                 app.is_external_editor_active = true; // TUI is now effectively suspended
-                                                // Don't set TUI status_message, it's not visible.
-                                                // eprintln used for out-of-band info if needed.
                                                 eprintln!(
                                                     "Launched streaming editor: {} with file {}",
                                                     editor_name, path_str
@@ -1323,6 +1377,7 @@ async fn run_app<B: Backend + std::io::Write>(
                                                     cursor::Hide
                                                 )?;
                                                 terminal.clear()?;
+                                                needs_redraw = true;
                                             }
                                         }
                                     }
@@ -1342,12 +1397,20 @@ async fn run_app<B: Backend + std::io::Write>(
                                         cursor::Hide
                                     )?;
                                     terminal.clear()?;
+                                    needs_redraw = true;
                                 }
                             }
                         }
                         AppAction::None => {}
                     }
                 }
+            }
+        } else if last_tick.elapsed() >= tick_rate {
+            // No event, but tick timeout reached
+            last_tick = StdInstant::now();
+            // Only redraw on tick if there's an animation (like AI typing)
+            if app.is_loading {
+                needs_redraw = true;
             }
         }
 
@@ -1361,7 +1424,6 @@ async fn run_app<B: Backend + std::io::Write>(
                 DisableMouseCapture,
                 cursor::Show
             )?;
-            // Don't call terminal.clear() here before external editor
 
             let editor_result = open_content_in_editor_blocking(&text_to_edit);
 
@@ -1395,15 +1457,13 @@ async fn run_app<B: Backend + std::io::Write>(
                 }
             }
             app.is_editing_current_input = false; // Reset flag
-            // Force redraw TUI
+            needs_redraw = true;
+        }
+
+        // Only redraw if needed
+        if needs_redraw && !app.is_external_editor_active {
             terminal.draw(|f| ui(f, app))?;
-            last_tick = StdInstant::now();
-        } else if !app.is_external_editor_active {
-            // Only draw if no editor is active and not just handled blocking editor
-            if last_tick.elapsed() >= tick_rate || timeout == Duration::from_secs(0) {
-                terminal.draw(|f| ui(f, app))?;
-                last_tick = StdInstant::now();
-            }
+            needs_redraw = false;
         }
     }
 }
@@ -1442,22 +1502,61 @@ fn ui_chatting(f: &mut Frame, app: &mut App) {
         (chat_pane_height / 3).max(1) // Otherwise, 1/3rd is reasonable
     };
 
+    // Prepare conversation title outside of the list rendering
+    let conv_title = app.cached_conversation_title.clone().unwrap_or_else(|| {
+        let title = app
+            .current_conversation_id
+            .as_ref()
+            .and_then(|id| {
+                app.db_conn
+                    .query_row(
+                        "SELECT title FROM conversations WHERE id = ?1",
+                        params![id],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()
+                    .ok()
+                    .flatten()
+            })
+            .map(|t| {
+                if t.len() > 20 {
+                    format!("{}...", t.chars().take(17).collect::<String>())
+                } else {
+                    t
+                }
+            })
+            .unwrap_or_else(|| "New Chat".to_string());
+
+        // Cache the title
+        app.cached_conversation_title = Some(title.clone());
+        title
+    });
+
+    // Pre-compute indentation strings for all message roles
+    let user_prefix = "You: ";
+    let assistant_prefix = "AI:  "; // Extra space for alignment
+    let system_prefix = "Sys: ";
+    let user_indent = " ".repeat(user_prefix.len());
+    let assistant_indent = " ".repeat(assistant_prefix.len());
+    let system_indent = " ".repeat(system_prefix.len());
+
     let display_messages: Vec<ListItem> = app
         .messages
-        .iter()
+        .iter_mut() // Change to iter_mut to update cache
         .map(|msg| {
             let style = if msg.role == Role::User {
                 theme.user_style
             } else {
                 theme.assistant_style
             };
-            let prefix_str = match msg.role {
-                Role::User => "You: ",
-                Role::Assistant => "AI:  ", // Extra space for alignment
-                _ => "Sys: ",
+
+            let (prefix_str, indentation) = match msg.role {
+                Role::User => (user_prefix, &user_indent),
+                Role::Assistant => (assistant_prefix, &assistant_indent),
+                _ => (system_prefix, &system_indent),
             };
+
             let prefix_len = prefix_str.len() as u16;
-            let indentation = " ".repeat(prefix_str.len());
 
             // Ensure content_wrap_width is at least 1
             let content_wrap_width = chat_area_width
@@ -1465,7 +1564,20 @@ fn ui_chatting(f: &mut Frame, app: &mut App) {
                 .saturating_sub(highlight_symbol_len.saturating_add(1)) // Space for highlight symbol and a margin
                 .max(1);
 
-            let wrapped_strings = textwrap::wrap(&msg.content, content_wrap_width as usize);
+            // Only recalculate wrapped lines if the width changed or not calculated yet
+            let wrapped_strings = if msg.cached_wrap_width != Some(content_wrap_width)
+                || msg.cached_wrapped_lines.is_none()
+            {
+                let wrapped = textwrap::wrap(&msg.content, content_wrap_width as usize);
+                // Convert Cow<'_, str> to String for caching
+                let wrapped_strings: Vec<String> =
+                    wrapped.into_iter().map(|cow| cow.into_owned()).collect();
+                msg.cached_wrapped_lines = Some(wrapped_strings.clone());
+                msg.cached_wrap_width = Some(content_wrap_width);
+                wrapped_strings
+            } else {
+                msg.cached_wrapped_lines.clone().unwrap()
+            };
 
             let mut all_lines: Vec<Line> = vec![];
             let prefix_span = Span::styled(prefix_str, style.add_modifier(Modifier::BOLD));
@@ -1533,29 +1645,6 @@ fn ui_chatting(f: &mut Frame, app: &mut App) {
         })
         .alignment(Alignment::Left);
     f.render_widget(status_bar, chunks[1]);
-
-    let conv_title = app
-        .current_conversation_id
-        .as_ref()
-        .and_then(|id| {
-            app.db_conn
-                .query_row(
-                    "SELECT title FROM conversations WHERE id = ?1",
-                    params![id],
-                    |row| row.get::<_, String>(0),
-                )
-                .optional()
-                .ok()
-                .flatten()
-        })
-        .map(|t| {
-            if t.len() > 20 {
-                format!("{}...", t.chars().take(17).collect::<String>())
-            } else {
-                t
-            }
-        })
-        .unwrap_or_else(|| "New Chat".to_string());
 
     let input_title = format!(
         "To {} (ID: {}...)",

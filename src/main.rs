@@ -157,7 +157,8 @@ struct App<'a> {
     _config_source_message: String,
     update_sender: mpsc::Sender<AppUpdate>,
     update_receiver: mpsc::Receiver<AppUpdate>,
-    message_list_state: ListState,
+    selected_message: Option<usize>, // Replace message_list_state
+    scroll_offset: usize,            // Add scroll offset for virtual scrolling
     input_cursor_position: usize,
     status_message: Option<String>,
     theme: Theme<'a>,
@@ -313,7 +314,8 @@ impl<'a> App<'a> {
             _config_source_message: config_source,
             update_sender: tx,
             update_receiver: rx,
-            message_list_state: ListState::default(),
+            selected_message: None,
+            scroll_offset: 0,
             input_cursor_position: 0,
             status_message: Some("".to_string()),
             theme: Theme::default(),
@@ -415,8 +417,7 @@ impl<'a> App<'a> {
         {
             self.status_message = Some(format!("Error saving message: {}", e));
         }
-        self.message_list_state
-            .select(Some(self.messages.len().saturating_sub(1)));
+        self.selected_message = Some(self.messages.len() - 1);
         self.input.clear();
         self.input_cursor_position = 0;
         self.is_loading = true;
@@ -593,7 +594,7 @@ impl<'a> App<'a> {
                     self.current_conversation_id = None;
                     self.input.clear();
                     self.input_cursor_position = 0;
-                    self.message_list_state.select(None);
+                    self.selected_message = None;
                     // Reset caches for new chat
                     self.reset_message_cache();
                     self.status_message = Some("New chat started.".to_string());
@@ -629,8 +630,7 @@ impl<'a> App<'a> {
                             return AppAction::None;
                         }
                     } else {
-                        let content_to_edit = if let Some(idx) = self.message_list_state.selected()
-                        {
+                        let content_to_edit = if let Some(idx) = self.selected_message {
                             self.messages.get(idx).map(|m| m.content.clone())
                         } else {
                             None
@@ -692,23 +692,21 @@ impl<'a> App<'a> {
             }
             KeyCode::Up => {
                 if !self.messages.is_empty() {
-                    match self.message_list_state.selected() {
-                        Some(idx) if idx > 0 => self.message_list_state.select(Some(idx - 1)),
-                        Some(_) => self.message_list_state.select(Some(0)),
-                        None => self
-                            .message_list_state
-                            .select(Some(self.messages.len() - 1)),
+                    match self.selected_message {
+                        Some(idx) if idx > 0 => self.selected_message = Some(idx - 1),
+                        Some(_) => self.selected_message = Some(0),
+                        None => self.selected_message = Some(self.messages.len() - 1),
                     }
                 }
             }
             KeyCode::Down => {
                 if !self.messages.is_empty() {
-                    match self.message_list_state.selected() {
+                    match self.selected_message {
                         Some(idx) if idx < self.messages.len() - 1 => {
-                            self.message_list_state.select(Some(idx + 1))
+                            self.selected_message = Some(idx + 1)
                         }
-                        Some(idx) => self.message_list_state.select(Some(idx)),
-                        None => self.message_list_state.select(Some(0)),
+                        Some(idx) => self.selected_message = Some(idx),
+                        None => self.selected_message = Some(0),
                     }
                 }
             }
@@ -761,7 +759,7 @@ impl<'a> App<'a> {
                 self.messages.clear();
                 self.current_conversation_id = None;
                 self.input.clear();
-                self.message_list_state.select(None);
+                self.selected_message = None;
                 self.status_message = Some("New chat started.".to_string());
                 // Reset caches for new chat
                 self.reset_message_cache();
@@ -851,11 +849,11 @@ impl<'a> App<'a> {
             }
         }
         self.current_conversation_id = Some(conv_id.to_string());
-        self.message_list_state.select(if self.messages.is_empty() {
+        self.selected_message = if self.messages.is_empty() {
             None
         } else {
             Some(self.messages.len() - 1)
-        });
+        };
 
         // Clear the conversation title cache when loading a new conversation
         self.cached_conversation_title = None;
@@ -909,8 +907,7 @@ impl<'a> App<'a> {
                         self.status_message = Some("AI Typing...".to_string());
                         // Always keep the latest message selected when AI is typing
                         if !self.messages.is_empty() {
-                            self.message_list_state
-                                .select(Some(self.messages.len() - 1));
+                            self.selected_message = Some(self.messages.len() - 1);
                         }
                     }
 
@@ -953,8 +950,7 @@ impl<'a> App<'a> {
                             err_msg.chars().take(50).collect::<String>()
                         ));
                         if !self.messages.is_empty() {
-                            self.message_list_state
-                                .select(Some(self.messages.len() - 1));
+                            self.selected_message = Some(self.messages.len() - 1);
                         }
                     } else {
                         eprintln!("Assistant Error while editor active: {}", err_msg);
@@ -1003,10 +999,9 @@ impl<'a> App<'a> {
                             self.messages.pop();
                         }
                         if !self.messages.is_empty() {
-                            self.message_list_state
-                                .select(Some(self.messages.len().saturating_sub(1)));
+                            self.selected_message = Some(self.messages.len() - 1);
                         } else {
-                            self.message_list_state.select(None);
+                            self.selected_message = None;
                         }
                     }
                     // If editor was active, user will close it. `run_app` handles process exit.
@@ -1056,10 +1051,9 @@ impl<'a> App<'a> {
                     if !self.is_external_editor_active {
                         self.status_message = Some(final_status_message);
                         if self.messages.is_empty() {
-                            self.message_list_state.select(None);
+                            self.selected_message = None;
                         } else {
-                            self.message_list_state
-                                .select(Some(self.messages.len().saturating_sub(1)));
+                            self.selected_message = Some(self.messages.len() - 1);
                         }
                     } else {
                         eprintln!("{}", final_status_message);
@@ -1547,19 +1541,53 @@ fn ui_chatting(f: &mut Frame, app: &mut App) {
         )
         .split(f.area());
 
-    let chat_area_width = chunks[0].width;
-    let chat_pane_height = chunks[0].height;
-    let highlight_symbol_len = HIGHLIGHT_SYMBOL.len() as u16;
+    // Render title bar
+    let title_block = Block::default()
+        .borders(Borders::NONE)
+        .title(Span::styled(
+            APP_TITLE,
+            theme.chat_block_title_style.clone(),
+        ))
+        .title_alignment(Alignment::Center);
+    f.render_widget(title_block, chunks[0]);
 
-    // Heuristic for message block height: avoid tiny scrollable areas if pane is small.
-    // If pane is very small, allow messages to take more than 1/3rd.
-    let max_message_block_height = if chat_pane_height < 10 {
-        (chat_pane_height / 2).max(1) // If very small pane, allow up to half per message block
-    } else {
-        (chat_pane_height / 3).max(1) // Otherwise, 1/3rd is reasonable
+    // Calculate visible messages area (subtract title line)
+    let messages_area = Rect {
+        x: chunks[0].x,
+        y: chunks[0].y + 1,
+        width: chunks[0].width,
+        height: chunks[0].height.saturating_sub(1),
     };
 
-    // Prepare conversation title outside of the list rendering
+    // Clone theme styles needed for message rendering to avoid borrowing conflict
+    let user_style = theme.user_style;
+    let assistant_style = theme.assistant_style;
+    let highlight_style = theme.highlight_style;
+    let loading_style = theme.loading_style;
+    let status_style = theme.status_style;
+    let base_style = theme.base_style;
+    let input_block_title_style = theme.input_block_title_style.clone();
+
+    render_messages_custom(
+        f,
+        messages_area,
+        app,
+        user_style,
+        assistant_style,
+        highlight_style,
+    );
+
+    let status_text = app.status_message.as_deref().unwrap_or("");
+    let status_bar = Paragraph::new(status_text)
+        .style(if app.is_loading {
+            loading_style
+        } else {
+            status_style
+        })
+        .alignment(Alignment::Left);
+    f.render_widget(status_bar, chunks[1]);
+
+    // Prepare conversation title outside of the input rendering
     let conv_title = app.cached_conversation_title.clone().unwrap_or_else(|| {
         let title = app
             .current_conversation_id
@@ -1589,118 +1617,6 @@ fn ui_chatting(f: &mut Frame, app: &mut App) {
         title
     });
 
-    // Pre-compute indentation strings for all message roles
-    let user_prefix = "You: ";
-    let assistant_prefix = "AI:  "; // Extra space for alignment
-    let system_prefix = "Sys: ";
-    let user_indent = " ".repeat(user_prefix.len());
-    let assistant_indent = " ".repeat(assistant_prefix.len());
-    let system_indent = " ".repeat(system_prefix.len());
-
-    let display_messages: Vec<ListItem> = app
-        .messages
-        .iter_mut() // Change to iter_mut to update cache
-        .map(|msg| {
-            let style = if msg.role == Role::User {
-                theme.user_style
-            } else {
-                theme.assistant_style
-            };
-
-            let (prefix_str, indentation) = match msg.role {
-                Role::User => (user_prefix, &user_indent),
-                Role::Assistant => (assistant_prefix, &assistant_indent),
-                _ => (system_prefix, &system_indent),
-            };
-
-            let prefix_len = prefix_str.len() as u16;
-
-            // Ensure content_wrap_width is at least 1
-            let content_wrap_width = chat_area_width
-                .saturating_sub(prefix_len) // Space for prefix
-                .saturating_sub(highlight_symbol_len.saturating_add(1)) // Space for highlight symbol and a margin
-                .max(1);
-
-            // Only recalculate wrapped lines if the width changed or not calculated yet
-            let wrapped_strings = if msg.cached_wrap_width != Some(content_wrap_width)
-                || msg.cached_wrapped_lines.is_none()
-            {
-                let wrapped = textwrap::wrap(&msg.content, content_wrap_width as usize);
-                // Convert Cow<'_, str> to String for caching
-                let wrapped_strings: Vec<String> =
-                    wrapped.into_iter().map(|cow| cow.into_owned()).collect();
-                msg.cached_wrapped_lines = Some(wrapped_strings.clone());
-                msg.cached_wrap_width = Some(content_wrap_width);
-                wrapped_strings
-            } else {
-                msg.cached_wrapped_lines.clone().unwrap()
-            };
-
-            let mut all_lines: Vec<Line> = vec![];
-            let prefix_span = Span::styled(prefix_str, style.add_modifier(Modifier::BOLD));
-
-            if let Some(first_wrapped_line) = wrapped_strings.first() {
-                all_lines.push(Line::from(vec![
-                    prefix_span.clone(),
-                    Span::styled(first_wrapped_line.clone(), style),
-                ]));
-            } else if !msg.content.is_empty() {
-                // Handle case where content is not empty but wrapping results in no lines (e.g. too small width)
-                all_lines.push(Line::from(vec![
-                    prefix_span.clone(),
-                    Span::styled(msg.content.clone(), style), // Show original content, may overflow
-                ]));
-            } else {
-                // Empty content (e.g. AI is typing but sent no content yet)
-                all_lines.push(Line::from(prefix_span.clone()));
-            }
-
-            for line_content in wrapped_strings.iter().skip(1) {
-                all_lines.push(Line::from(vec![
-                    Span::raw(indentation.clone()),
-                    Span::styled(line_content.clone(), style),
-                ]));
-            }
-
-            // If content is larger than max height, show the last lines (auto-scroll)
-            let display_lines = if all_lines.len() > max_message_block_height as usize {
-                let start_idx = all_lines
-                    .len()
-                    .saturating_sub(max_message_block_height as usize);
-                all_lines[start_idx..].to_vec()
-            } else {
-                all_lines
-            };
-
-            ListItem::new(Text::from(display_lines))
-        })
-        .collect();
-
-    let messages_list = List::new(display_messages)
-        .block(
-            Block::default()
-                .borders(Borders::NONE) // No border for message pane itself
-                .title(Span::styled(
-                    APP_TITLE,
-                    theme.chat_block_title_style.clone(),
-                ))
-                .title_alignment(Alignment::Center),
-        )
-        .highlight_style(theme.highlight_style.clone())
-        .highlight_symbol(HIGHLIGHT_SYMBOL);
-
-    f.render_stateful_widget(messages_list, chunks[0], &mut app.message_list_state);
-
-    let status_text = app.status_message.as_deref().unwrap_or("");
-    let status_bar = Paragraph::new(status_text)
-        .style(if app.is_loading {
-            theme.loading_style
-        } else {
-            theme.status_style
-        })
-        .alignment(Alignment::Left);
-    f.render_widget(status_bar, chunks[1]);
-
     let input_title = format!(
         "To {} (ID: {}...)",
         conv_title,
@@ -1712,13 +1628,13 @@ fn ui_chatting(f: &mut Frame, app: &mut App) {
 
     let input_paragraph = Paragraph::new(app.input.as_str())
         .style(if app.is_loading {
-            theme.status_style // Dim input when loading
+            status_style // Dim input when loading
         } else {
-            theme.base_style
+            base_style
         })
         .block(Block::default().borders(Borders::ALL).title(Span::styled(
             input_title, // Dynamic title for input
-            theme.input_block_title_style.clone(),
+            input_block_title_style,
         )));
     f.render_widget(input_paragraph, chunks[2]);
 
@@ -1731,6 +1647,222 @@ fn ui_chatting(f: &mut Frame, app: &mut App) {
             chunks[2].x + app.input_cursor_position as u16 + 1, // +1 for border
             chunks[2].y + 1,                                    // +1 for border
         ));
+    }
+}
+
+fn render_messages_custom(
+    f: &mut Frame,
+    area: Rect,
+    app: &mut App,
+    user_style: Style,
+    assistant_style: Style,
+    highlight_style: Style,
+) {
+    if app.messages.is_empty() {
+        return;
+    }
+
+    let highlight_symbol_len = HIGHLIGHT_SYMBOL.len() as u16;
+    let selected_message = app.selected_message; // Extract before mutable borrow
+    let available_height = area.height as usize;
+
+    // Heuristic for message block height: avoid tiny scrollable areas if pane is small.
+    // If pane is very small, allow messages to take more than 1/3rd.
+    let max_message_block_height = if available_height < 10 {
+        (available_height / 2).max(1) // If very small pane, allow up to half per message block
+    } else {
+        (available_height / 3).max(1) // Otherwise, 1/3rd is reasonable
+    };
+
+    // Pre-compute indentation strings for all message roles
+    let user_prefix = "You: ";
+    let assistant_prefix = "AI:  "; // Extra space for alignment
+    let system_prefix = "Sys: ";
+    let user_indent = " ".repeat(user_prefix.len());
+    let assistant_indent = " ".repeat(assistant_prefix.len());
+    let system_indent = " ".repeat(system_prefix.len());
+
+    // Calculate wrapped lines for all messages first
+    let mut message_display_data: Vec<(Vec<Line>, bool, usize)> = Vec::new(); // Added start_line_idx
+    let mut total_lines = 0;
+
+    for (msg_idx, msg) in app.messages.iter_mut().enumerate() {
+        let style = if msg.role == Role::User {
+            user_style
+        } else {
+            assistant_style
+        };
+
+        let (prefix_str, indentation) = match msg.role {
+            Role::User => (user_prefix, &user_indent),
+            Role::Assistant => (assistant_prefix, &assistant_indent),
+            _ => (system_prefix, &system_indent),
+        };
+
+        let prefix_len = prefix_str.len() as u16;
+
+        // Ensure content_wrap_width is at least 1
+        let content_wrap_width = area
+            .width
+            .saturating_sub(prefix_len) // Space for prefix
+            .saturating_sub(highlight_symbol_len.saturating_add(1)) // Space for highlight symbol and a margin
+            .max(1);
+
+        // Only recalculate wrapped lines if the width changed or not calculated yet
+        let wrapped_strings = if msg.cached_wrap_width != Some(content_wrap_width)
+            || msg.cached_wrapped_lines.is_none()
+        {
+            let wrapped = textwrap::wrap(&msg.content, content_wrap_width as usize);
+            // Convert Cow<'_, str> to String for caching
+            let wrapped_strings: Vec<String> =
+                wrapped.into_iter().map(|cow| cow.into_owned()).collect();
+            msg.cached_wrapped_lines = Some(wrapped_strings.clone());
+            msg.cached_wrap_width = Some(content_wrap_width);
+            wrapped_strings
+        } else {
+            msg.cached_wrapped_lines.clone().unwrap()
+        };
+
+        let mut all_lines: Vec<Line> = vec![];
+
+        let prefix_span = Span::styled(prefix_str, style.add_modifier(Modifier::BOLD));
+
+        if let Some(first_wrapped_line) = wrapped_strings.first() {
+            all_lines.push(Line::from(vec![
+                prefix_span.clone(),
+                Span::styled(first_wrapped_line.clone(), style),
+            ]));
+        } else if !msg.content.is_empty() {
+            // Handle case where content is not empty but wrapping results in no lines
+            all_lines.push(Line::from(vec![
+                prefix_span.clone(),
+                Span::styled(msg.content.clone(), style), // Show original content, may overflow
+            ]));
+        } else {
+            // Empty content (e.g. AI is typing but sent no content yet)
+            all_lines.push(Line::from(prefix_span.clone()));
+        }
+
+        for line_content in wrapped_strings.iter().skip(1) {
+            all_lines.push(Line::from(vec![
+                Span::raw(indentation.clone()),
+                Span::styled(line_content.clone(), style),
+            ]));
+        }
+
+        // Apply max message height limit and auto-scroll to show newest text
+        let mut display_lines = if all_lines.len() > max_message_block_height {
+            let start_idx = all_lines.len().saturating_sub(max_message_block_height);
+            all_lines[start_idx..].to_vec()
+        } else {
+            all_lines
+        };
+
+        // Add top border line for each message (except the first one) AFTER height limiting
+        if msg_idx > 0 {
+            let border_width = area.width.saturating_sub(highlight_symbol_len + 1) as usize;
+            let border_line = "─".repeat(border_width);
+            let border = Line::from(vec![Span::styled(
+                border_line,
+                Style::default().fg(Color::DarkGray),
+            )]);
+            // Insert at the beginning so border is always visible
+            display_lines.insert(0, border);
+        }
+
+        let is_selected = selected_message == Some(msg_idx);
+        let message_start_line = total_lines;
+        total_lines += display_lines.len();
+        message_display_data.push((display_lines, is_selected, message_start_line));
+    }
+
+    // Calculate scroll position to ensure selected message is visible
+    let mut start_line = app.scroll_offset;
+
+    // If we have a selected message, ensure it's visible
+    if let Some(selected_idx) = selected_message {
+        if selected_idx < message_display_data.len() {
+            let (_, _, selected_start_line) = &message_display_data[selected_idx];
+            let selected_end_line = if selected_idx + 1 < message_display_data.len() {
+                message_display_data[selected_idx + 1].2
+            } else {
+                total_lines
+            };
+
+            // If selected message is above the viewport, scroll up
+            if *selected_start_line < start_line {
+                start_line = *selected_start_line;
+            }
+            // If selected message is below the viewport, scroll down
+            else if selected_end_line > start_line + available_height {
+                start_line = selected_end_line.saturating_sub(available_height);
+            }
+        }
+    }
+    // If no selection, auto-scroll to bottom to show latest messages
+    else if total_lines > available_height {
+        start_line = total_lines.saturating_sub(available_height);
+    }
+
+    // Update app's scroll offset
+    app.scroll_offset = start_line;
+
+    // Render messages line by line
+    let mut current_y = area.y;
+    let mut current_line = 0;
+
+    for (_msg_idx, (lines, is_selected, _)) in message_display_data.iter().enumerate() {
+        for (line_idx, line) in lines.iter().enumerate() {
+            if current_line >= start_line && current_y < area.y + area.height {
+                // Check if this is a border line (first line of messages after the first message)
+                let is_border_line =
+                    line.spans.len() == 1 && line.spans[0].content.chars().all(|c| c == '─');
+
+                // Determine if this line should be highlighted
+                let line_style = if *is_selected && !is_border_line {
+                    highlight_style
+                } else {
+                    Style::default()
+                };
+
+                // Create the line content with highlight symbol if needed
+                let display_line = if is_border_line {
+                    // Border lines don't get highlight symbols, just render as-is with padding
+                    let mut spans = vec![Span::raw(" ".repeat(highlight_symbol_len as usize))];
+                    spans.extend_from_slice(&line.spans);
+                    Line::from(spans)
+                } else if *is_selected && line_idx == 0 {
+                    // Add highlight symbol to first line of selected message
+                    let mut spans = vec![Span::styled(HIGHLIGHT_SYMBOL, line_style)];
+                    spans.extend_from_slice(&line.spans);
+                    Line::from(spans)
+                } else if *is_selected {
+                    // Add spaces to align with highlight symbol for continuation lines
+                    let mut spans = vec![Span::raw(" ".repeat(highlight_symbol_len as usize))];
+                    spans.extend_from_slice(&line.spans);
+                    Line::from(spans)
+                } else {
+                    // No selection, just add spaces where highlight symbol would be
+                    let mut spans = vec![Span::raw(" ".repeat(highlight_symbol_len as usize))];
+                    spans.extend_from_slice(&line.spans);
+                    Line::from(spans)
+                };
+
+                // Render the line
+                let line_area = Rect {
+                    x: area.x,
+                    y: current_y,
+                    width: area.width,
+                    height: 1,
+                };
+
+                let paragraph = Paragraph::new(Text::from(vec![display_line])).style(line_style);
+                f.render_widget(paragraph, line_area);
+
+                current_y += 1;
+            }
+            current_line += 1;
+        }
     }
 }
 

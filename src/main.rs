@@ -4,7 +4,8 @@ use async_openai::{
     config::OpenAIConfig,
     types::{
         ChatCompletionRequestAssistantMessageArgs, ChatCompletionRequestMessage,
-        ChatCompletionRequestUserMessageArgs, CreateChatCompletionRequestArgs, Role,
+        ChatCompletionRequestUserMessageArgs, CreateChatCompletionRequest,
+        CreateChatCompletionRequestArgs, Role,
     },
 };
 use crossterm::{
@@ -53,13 +54,24 @@ const MAX_TITLE_LEN: usize = 50;
 #[derive(Deserialize, Debug, Default, Clone)]
 struct EndpointsTomlConfig {
     default_openai_endpoint: Option<String>,
+    default_azure_endpoint: Option<String>,
     openai_endpoints: Option<HashMap<String, OpenAIEndpointToml>>,
+    azure_endpoints: Option<HashMap<String, AzureEndpointToml>>,
 }
 
 #[derive(Deserialize, Debug, Clone)]
 struct OpenAIEndpointToml {
     api_key: Option<String>,
     api_base: Option<String>,
+    default_model: Option<String>,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+struct AzureEndpointToml {
+    api_key: Option<String>,
+    api_base: Option<String>,
+    api_version: Option<String>,
+    deployment_id: Option<String>,
     default_model: Option<String>,
 }
 
@@ -142,16 +154,30 @@ struct ConversationMeta {
     updated_at: DateTime<Utc>,
 }
 
-// Create an enum to handle different config types
-enum ClientConfig {
-    OpenAI(OpenAIConfig),
-    Azure(AzureConfig),
+// Create an enum to handle different client types
+#[derive(Clone)]
+enum ClientWrapper {
+    OpenAI(Client<OpenAIConfig>),
+    Azure(Client<AzureConfig>),
+}
+
+impl ClientWrapper {
+    async fn chat_create_stream(
+        &self,
+        request: CreateChatCompletionRequest,
+    ) -> Result<async_openai::types::ChatCompletionResponseStream, async_openai::error::OpenAIError>
+    {
+        match self {
+            ClientWrapper::OpenAI(client) => client.chat().create_stream(request).await,
+            ClientWrapper::Azure(client) => client.chat().create_stream(request).await,
+        }
+    }
 }
 
 struct App<'a> {
     input: String,
     messages: Vec<AppMessage>,
-    openai_client: Client<OpenAIConfig>,
+    openai_client: ClientWrapper,
     model_to_use: String,
     is_loading: bool,
     _config_source_message: String,
@@ -299,7 +325,7 @@ fn open_content_in_editor_blocking(initial_content: &str) -> Result<String, Box<
 
 impl<'a> App<'a> {
     fn new(
-        client: Client<OpenAIConfig>,
+        client: ClientWrapper,
         model: String,
         config_source: String,
         db_conn: Connection,
@@ -469,7 +495,7 @@ impl<'a> App<'a> {
                 return;
             }
 
-            let stream_result = client.chat().create_stream(request_args.unwrap()).await;
+            let stream_result = client.chat_create_stream(request_args.unwrap()).await;
 
             match stream_result {
                 Ok(mut stream) => {
@@ -1131,47 +1157,132 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
         EndpointsTomlConfig::default()
     });
-    let mut selected_endpoint_details: Option<OpenAIEndpointToml> = None;
+    let mut selected_openai_endpoint: Option<OpenAIEndpointToml> = None;
+    let mut selected_azure_endpoint: Option<AzureEndpointToml> = None;
     let mut config_source_message: String = "Defaults (e.g. OPENAI_API_KEY env var)".to_string();
-    let endpoint_name_to_load: Option<String> = chosen_endpoint_name_from_cli
-        .clone()
-        .or_else(|| toml_config.default_openai_endpoint.clone());
-    if let Some(name) = &endpoint_name_to_load {
-        if let Some(endpoints_map) = &toml_config.openai_endpoints {
-            if let Some(details) = endpoints_map.get(name) {
-                selected_endpoint_details = Some(details.clone());
-                config_source_message = format!("endpoint '{}' from TOML", name);
-            } else {
-                eprintln!("Warning: Endpoint '{}' not found in TOML.", name);
+
+    // First, try to find the endpoint by name in both OpenAI and Azure sections
+    if let Some(name) = &chosen_endpoint_name_from_cli {
+        // Check OpenAI endpoints first
+        if let Some(openai_endpoints_map) = &toml_config.openai_endpoints {
+            if let Some(details) = openai_endpoints_map.get(name) {
+                selected_openai_endpoint = Some(details.clone());
+                config_source_message = format!("OpenAI endpoint '{}' from TOML", name);
             }
-        } else if chosen_endpoint_name_from_cli.is_some()
-            || toml_config.default_openai_endpoint.is_some()
-        {
-            eprintln!(
-                "Warning: Endpoint '{}' specified, but no [openai_endpoints] table in TOML.",
-                name
-            );
         }
-    } else if let Some(endpoints_map) = &toml_config.openai_endpoints {
-        if let Some((name, details)) = endpoints_map.iter().next() {
-            selected_endpoint_details = Some(details.clone());
-            config_source_message = format!("first available endpoint '{}' from TOML", name);
+
+        // If not found in OpenAI, check Azure endpoints
+        if selected_openai_endpoint.is_none() {
+            if let Some(azure_endpoints_map) = &toml_config.azure_endpoints {
+                if let Some(details) = azure_endpoints_map.get(name) {
+                    selected_azure_endpoint = Some(details.clone());
+                    config_source_message = format!("Azure endpoint '{}' from TOML", name);
+                }
+            }
+        }
+
+        if selected_openai_endpoint.is_none() && selected_azure_endpoint.is_none() {
+            eprintln!("Warning: Endpoint '{}' not found in TOML.", name);
         }
     }
-    let mut openai_client_config = OpenAIConfig::new();
+
+    // If no CLI endpoint specified or not found, try defaults
+    if selected_openai_endpoint.is_none() && selected_azure_endpoint.is_none() {
+        // Try default Azure endpoint first
+        if let Some(default_azure_name) = &toml_config.default_azure_endpoint {
+            if let Some(azure_endpoints_map) = &toml_config.azure_endpoints {
+                if let Some(details) = azure_endpoints_map.get(default_azure_name) {
+                    selected_azure_endpoint = Some(details.clone());
+                    config_source_message =
+                        format!("default Azure endpoint '{}' from TOML", default_azure_name);
+                }
+            }
+        }
+
+        // If no Azure default, try OpenAI default
+        if selected_azure_endpoint.is_none() {
+            if let Some(default_openai_name) = &toml_config.default_openai_endpoint {
+                if let Some(openai_endpoints_map) = &toml_config.openai_endpoints {
+                    if let Some(details) = openai_endpoints_map.get(default_openai_name) {
+                        selected_openai_endpoint = Some(details.clone());
+                        config_source_message = format!(
+                            "default OpenAI endpoint '{}' from TOML",
+                            default_openai_name
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // If still no endpoints found, try the first available endpoint
+    if selected_openai_endpoint.is_none() && selected_azure_endpoint.is_none() {
+        // Try first Azure endpoint
+        if let Some(azure_endpoints_map) = &toml_config.azure_endpoints {
+            if let Some((name, details)) = azure_endpoints_map.iter().next() {
+                selected_azure_endpoint = Some(details.clone());
+                config_source_message =
+                    format!("first available Azure endpoint '{}' from TOML", name);
+            }
+        }
+
+        // If no Azure endpoints, try first OpenAI endpoint
+        if selected_azure_endpoint.is_none() {
+            if let Some(openai_endpoints_map) = &toml_config.openai_endpoints {
+                if let Some((name, details)) = openai_endpoints_map.iter().next() {
+                    selected_openai_endpoint = Some(details.clone());
+                    config_source_message =
+                        format!("first available OpenAI endpoint '{}' from TOML", name);
+                }
+            }
+        }
+    }
+
     let mut model_to_use = "gpt-4o".to_string(); // Default model
-    if let Some(details) = &selected_endpoint_details {
-        if let Some(key) = &details.api_key {
-            openai_client_config = openai_client_config.with_api_key(key);
+
+    // Determine client type and create appropriate client
+    let client = if let Some(azure_details) = &selected_azure_endpoint {
+        // Create Azure client
+        let mut azure_config = AzureConfig::new();
+
+        if let Some(key) = &azure_details.api_key {
+            azure_config = azure_config.with_api_key(key);
         }
-        if let Some(base) = &details.api_base {
-            openai_client_config = openai_client_config.with_api_base(base);
+        if let Some(base) = &azure_details.api_base {
+            azure_config = azure_config.with_api_base(base);
         }
-        if let Some(model) = &details.default_model {
+        if let Some(version) = &azure_details.api_version {
+            azure_config = azure_config.with_api_version(version);
+        }
+        if let Some(deployment) = &azure_details.deployment_id {
+            azure_config = azure_config.with_deployment_id(deployment);
+        }
+
+        if let Some(model) = &azure_details.default_model {
             model_to_use = model.clone();
         }
-    }
-    let client = Client::with_config(openai_client_config);
+
+        ClientWrapper::Azure(Client::with_config(azure_config))
+    } else if let Some(openai_details) = &selected_openai_endpoint {
+        // Create OpenAI client
+        let mut openai_client_config = OpenAIConfig::new();
+
+        if let Some(key) = &openai_details.api_key {
+            openai_client_config = openai_client_config.with_api_key(key);
+        }
+        if let Some(base) = &openai_details.api_base {
+            openai_client_config = openai_client_config.with_api_base(base);
+        }
+        if let Some(model) = &openai_details.default_model {
+            model_to_use = model.clone();
+        }
+
+        ClientWrapper::OpenAI(Client::with_config(openai_client_config))
+    } else {
+        // Default OpenAI client
+        let openai_client_config = OpenAIConfig::new();
+        ClientWrapper::OpenAI(Client::with_config(openai_client_config))
+    };
     println!(
         "OpenAI client: {}. Model: {}.",
         &config_source_message, &model_to_use

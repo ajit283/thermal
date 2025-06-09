@@ -1,14 +1,25 @@
+<table>
+  <tr>
+    <td><img src="readme_assets/screenshot1.png" alt="Thermal Chat Interface" width="100%"></td>
+    <td><img src="readme_assets/screenshot2.png" alt="Thermal Conversation Picker" width="100%"></td>
+  </tr>
+</table>
+
 # Thermal
 
 ## Description
 
-Thermal is a Terminal User Interface (TUI) application for interacting with language models that adhere to the OpenAI API calling format. It allows you to chat with AI models directly from your terminal, stores conversation history locally in an SQLite database, and supports managing multiple conversations.
+A Terminal User Interface (TUI) for interacting with language models that adhere to the OpenAI API calling format. Chat directly from your terminal with several key benefits:
 
-Thermal requires API access to a language model service that is compatible with the OpenAI API format. Configuration is primarily handled via an `endpoints.toml` file.
+- Open messages directly in your `$EDITOR` for convenient copying, pasting, and multi-line input.
+- All conversations are saved locally in an SQLite database.
+- Works with any service providing an OpenAI-compatible API endpoint.
+
+Configuration is primarily handled via an `endpoints.toml` file.
 
 ### Chat History Storage
 
-Thermal stores your chat conversations in an SQLite database file named `chat_history.db`. The location of this file is determined as follows, in order of preference:
+Your chat conversations are stored in an SQLite database file named `chat_history.db`. The location of this file is determined as follows, in order of preference:
 
 1.  In the `thermal` subdirectory of your user's data directory (e.g., `~/.local/share/thermal/chat_history.db` on Linux, or `~/Library/Application Support/thermal/chat_history.db` on macOS).
 2.  If the data directory is not found, it tries the `thermal` subdirectory of your user's config directory (e.g., `~/.config/thermal/chat_history.db` on Linux).
@@ -16,7 +27,7 @@ Thermal stores your chat conversations in an SQLite database file named `chat_hi
 
 ### Endpoint Configuration
 
-Thermal looks for an `endpoints.toml` configuration file in the following locations, in order:
+The application looks for an `endpoints.toml` configuration file in the following locations, in order:
 
 1. The current directory (`./endpoints.toml`)
 2. The XDG config directory (e.g., `~/.config/thermal/endpoints.toml` on Linux/macOS). If this directory doesn't exist, Thermal will attempt to create it.
@@ -46,7 +57,7 @@ deployment_id = "yourDeploymentName"    # The name of your model deployment in A
 
 - **Multiple Endpoints:** You can define multiple OpenAI and Azure endpoints, each with a unique name (e.g., `my_openai_config_name`, `my_azure_config_name`).
 - **Default Endpoint:** Use `default_openai_endpoint` or `default_azure_endpoint` at the top level of the TOML file to specify which named configuration should be used by default if the application needs to pick one.
-- **OpenAI `api_key`:** If `api_key` is not provided in the `[openai_endpoints.<name>]` section, Thermal (via the `async-openai` library) will likely attempt to use the `OPENAI_API_KEY` environment variable.
+- **OpenAI `api_key`:** If `api_key` is not provided in the `[openai_endpoints.<name>]` section, the application (via the `async-openai` library) will likely attempt to use the `OPENAI_API_KEY` environment variable.
 - **Azure Configuration:** For Azure, `api_key`, `api_base`, `api_version`, and `deployment_id` are crucial.
 
 **Environment Variables:**
@@ -69,19 +80,18 @@ _Input & Sending Messages:_
 
 - **`Enter`**: Submit the current input text to the AI.
 - Standard text input for typing your message (includes backspace, left/right arrow navigation).
-- **`Ctrl+T`**: Opens the current text in the input box in an external editor (e.g., Vim, Nano). _Does not work if AI is responding._
+- **`Ctrl+T`**: Opens the current text in the input box in `$EDITOR`.
 
 _Navigation & Interaction:_
 
 - **`Up Arrow`**: Selects the previous message in the chat history for viewing or editing.
 - **`Down Arrow`**: Selects the next message in the chat history.
-- **`Ctrl+N`**: Clears the current chat and starts a new, empty conversation. _Does not work if AI is responding._
-- **`Ctrl+K`**: Switches to Conversation Picker mode to load or manage past conversations. _Does not work if AI is responding._
+- **`Ctrl+N`**: Clears the current chat and starts a new, empty conversation.
+- **`Ctrl+K`**: Switches to Conversation Picker mode to load or manage past conversations.
 - **`Ctrl+E`**:
-  - If AI is currently generating a response: Opens the _assistant's streaming response so far_ in an external editor (live view).
-  - If a message is selected in the chat history: Opens the _content of the selected message_ in an external editor.
-  - Otherwise (no message selected, AI not responding): Shows "No message selected".
-- **`Ctrl+X`**: Attempts to cancel the current AI generation if one is in progress. Shows "Nothing to cancel" otherwise.
+  - If AI is currently generating a response: Opens the _assistant's streaming response so far_ in `$EDITOR` (live view).
+  - If a message is selected in the chat history: Opens the _content of the selected message_ in `$EDITOR`.
+- **`Ctrl+X`**: Attempts to cancel the current AI generation if one is in progress.
 
 **Conversation Picker Mode:**
 
